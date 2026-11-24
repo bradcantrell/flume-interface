@@ -241,7 +241,9 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
       let z = (f32(k) + 0.5)*prm.dx; let ramp = min(tb[0]*prm.om, 1.0);
       if (i == 0u) {
         if (solid[prm.nx*k] != 0u) { u[c] = 0.0; return; }
-        if (prm.mode < 0.5) { let e = max(eta[0], prm.zin + prm.dx); u[c] = select(0.0, prm.q*ramp/(e - prm.zin), z < e); }
+        // every face with any part below the inlet surface e carries q / (e - zin); fluxX takes the
+        // wet fraction of each face, so exactly q dt comes in per step
+        if (prm.mode < 0.5) { let e = max(eta[0], prm.zin + prm.dx); u[c] = select(0.0, prm.q*ramp/(e - prm.zin), f32(k)*prm.dx < e); }
         else { let t = tb[0]; let rw = min(t*prm.om/12.566371, 1.0); u[c] = 0.5*prm.S*prm.om*sin(prm.om*t)*rw; }
         return; }
       if (i == prm.nx) {
@@ -253,9 +255,6 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
     bcW: K([['w', 'f'], ['solid', 'u']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
       if (k == 0u || k == prm.nz) { w[c] = 0.0; return; }
       if (solid[i+N*(k-1u)] != 0u || solid[i+N*k] != 0u) { w[c] = 0.0; }`),
-    inflowF: K([['f', 'f'], ['solid', 'u'], ['eta', 'f']], `if (c >= prm.nz) {return;} if (prm.mode > 0.5) {return;}
-      let k = c; let z = (f32(k) + 0.5)*prm.dx; let ci = prm.nx*k;
-      if (solid[ci] == 0u && z < max(eta[0], prm.zin + prm.dx)) { f[ci] = 1.0; }`),
     spongeU: K([['u', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} if (prm.mode < 0.5) {return;}
       let x = f32(c % W)*prm.dx; let L = f32(prm.nx)*prm.dx; if (x <= prm.sx0) {return;}
       let r = (x - prm.sx0)/max(L - prm.sx0, 1e-6); u[c] = u[c]/(1.0 + prm.srate*prm.dt*r*r);`),
@@ -325,9 +324,12 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
       if (b == 0u || t == 0u || (b != 1u && t != 1u)) { return; }
       var th = 1.0; if (b == 2u || t == 2u) { th = clamp(F[cb] + F[ct] - 0.5, 0.1, 1.0); }
       w[c] = BW[c]*(w[c] - prm.dt/prm.dx*(p[ct] - p[cb])/th);`),
-    fluxX: K([['f', 'f'], ['u', 'f'], ['fl', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = i32(c % W); let k = i32(c / W);
+    fluxX: K([['f', 'f'], ['u', 'f'], ['fl', 'f'], ['eta', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = i32(c % W); let k = i32(c / W);
       let vel = u[c]; if (vel == 0.0) { fl[c] = 0.0; return; } let s = abs(vel)*prm.dt/prm.dx;
       let di = select(i, i - 1, vel > 0.0);
+      if (di < 0 && prm.mode < 0.5) {      // river inflow: the wet fraction of this face, below the inlet surface
+        let e = max(eta[0], prm.zin + prm.dx);
+        fl[c] = s*clamp((e - f32(k)*prm.dx)/prm.dx, 0.0, 1.0); return; }
       if (di < 0 || di >= i32(prm.nx)) { fl[c] = sign(vel)*s*fAt(di, k); return; }
       fl[c] = sign(vel)*flux1(di, k, vel, s, 0u);`, PLIC),
     fluxZ: K([['f', 'f'], ['w', 'f'], ['fl', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = i32(c % N); let k = i32(c / N);
@@ -657,7 +659,6 @@ fn smp(i:i32, k:i32) -> f32 {
       advU: D('advectU', P0, [B.u, B.w, B.u2], NU), advW: D('advectW', P0, [B.u, B.w, B.w2], NW),
       advFU: D('advFU', P0, [B.u, B.w, B.u2, B.typ], NU), advFW: D('advFW', P0, [B.u, B.w, B.w2, B.typ], NW),
       bcU: D('bcU', P0, [B.u, B.solid, B.tb, B.eta], NU), bcW: D('bcW', P0, [B.w, B.solid], NW),
-      inflowF: D('inflowF', P0, [B.f, B.solid, B.eta], nz),
       spongeU: D('spongeU', P0, [B.u], NU), spongeW: D('spongeW', P0, [B.w], NW),
       rhs: D('rhs', P0, [B.typ, B.u, B.w, B.r, B.p, B.BU, B.BW], N),
       applyA: D('applyA0', P0, [B.typ, B.s, B.q, B.f, B.BU, B.BW], N),
@@ -667,7 +668,7 @@ fn smp(i:i32, k:i32) -> f32 {
       alpha: D('alpha', P0, [B.scal], 1), beta: D('beta', P0, [B.scal], 1),
       updPR: D('updPR', P0, [B.p, B.r, B.s, B.q, B.scal], N), updS: D('updS', P0, [B.s, B.z, B.scal], N),
       projU: D('projU', P0, [B.typ, B.p, B.u, B.f, B.BU], NU), projW: D('projW', P0, [B.typ, B.p, B.w, B.f, B.BW], NW),
-      fluxX: D('fluxX', P0, [B.f, B.u, B.flx], NU), fluxZ: D('fluxZ', P0, [B.f, B.w, B.flx], NW),
+      fluxX: D('fluxX', P0, [B.f, B.u, B.flx, B.eta], NU), fluxZ: D('fluxZ', P0, [B.f, B.w, B.flx], NW),
       updX: D('updX', P0, [B.f, B.f0, B.u, B.flx, B.solid], N), updZ: D('updZ', P0, [B.f, B.f0, B.w, B.flx, B.solid], N),
       surface: D('surface', P0, [B.f, B.solid, B.eta], nx), tick: D('tick', P0, [B.tb], 1),
       speed: D('speed', P0, [B.u, B.w, B.typ, B.tmp], N),
@@ -762,7 +763,7 @@ fn smp(i:i32, k:i32) -> f32 {
     clearMG(enc);
     pass = enc.beginComputePass(); vcycle(pass); run(pass, d.dotZR); run(pass, d.fin0); pass.end();
     enc.copyBufferToBuffer(M.S.B.z, 0, M.S.B.s, 0, M.S.N * 4);
-    for (let it = 0; it < K_CG; it++) {
+    for (let it = 0; it < (M.kcg || K_CG); it++) {
       pass = enc.beginComputePass(); run(pass, d.applyA); run(pass, d.dotSQ); run(pass, d.finSQ); run(pass, d.alpha); run(pass, d.updPR); pass.end();
       clearMG(enc);
       pass = enc.beginComputePass(); vcycle(pass); run(pass, d.dotZR); run(pass, d.fin4); run(pass, d.beta); run(pass, d.updS); pass.end();
@@ -771,7 +772,7 @@ fn smp(i:i32, k:i32) -> f32 {
   function encodeStep(enc, n) {
     const d = M.S.d, B = M.S.B;
     let pass = enc.beginComputePass();
-    run(pass, d.surface); run(pass, d.inflowF); run(pass, d.classify); run(pass, d.validU); run(pass, d.validW);
+    run(pass, d.surface); run(pass, d.classify); run(pass, d.validU); run(pass, d.validW);
     run(pass, d.exUab); run(pass, d.exUba); run(pass, d.exUab); run(pass, d.exWab); run(pass, d.exWba); run(pass, d.exWab);
     pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
