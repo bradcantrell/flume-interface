@@ -224,15 +224,19 @@ function rasterize() {
     const zb = bedZ((i + 0.5) * dx), kb = Math.min(nz, Math.round(zb / dx));
     for (let k = 0; k < kb; k++) { const c = i + nx * k; R.mat[c] = MAT.SEDIMENT; R.cls[c] = scene.bed.cls; }
   }
-  // shapes, in order: later shapes cover earlier ones; the eraser writes water
+  // shapes, in order: later shapes cover earlier ones; the eraser writes water. Plants and
+  // porous rock only take water cells: they stand on the bed and on solids, never replace them.
   for (const sh of scene.shapes) {
+    const onlyWater = sh.mat === MAT.POROUS || sh.mat === MAT.CANOPY;
     const b = bboxOf(sh);
     const i0 = Math.max(0, Math.floor(b.x0 / dx - 0.5)), i1 = Math.min(nx - 1, Math.ceil(b.x1 / dx - 0.5));
     const k0 = Math.max(0, Math.floor(b.z0 / dx - 0.5)), k1 = Math.min(nz - 1, Math.ceil(b.z1 / dx - 0.5));
     const pr = sh.props || {};
     for (let k = k0; k <= k1; k++) for (let i = i0; i <= i1; i++) {
       if (!contains(sh, (i + 0.5) * dx, (k + 0.5) * dx)) continue;
-      const c = i + nx * k; R.mat[c] = sh.mat; R.p1[c] = 0; R.p2[c] = 0; R.p3[c] = 0; R.cls[c] = 0;
+      const c = i + nx * k;
+      if (onlyWater && (R.mat[c] === MAT.SOLID || R.mat[c] === MAT.SEDIMENT)) continue;
+      R.mat[c] = sh.mat; R.p1[c] = 0; R.p2[c] = 0; R.p3[c] = 0; R.cls[c] = 0;
       if (sh.mat === MAT.POROUS) { R.p1[c] = pr.n; R.p2[c] = pr.d; }
       else if (sh.mat === MAT.CANOPY) { R.p1[c] = pr.a; R.p2[c] = pr.cd; R.p3[c] = pr.stem; }
       else if (sh.mat === MAT.SEDIMENT) { R.cls[c] = pr.cls | 0; }
@@ -322,6 +326,11 @@ function buildMatImage() {
   }
   matCtx.putImageData(img, 0, 0);
 }
+function matAt(x, z) {
+  const i = Math.floor(x / GRID.dx), k = Math.floor(z / GRID.dx);
+  if (i < 0 || k < 0 || i >= GRID.nx || k >= GRID.nz) return -1;
+  return RASTER.mat[i + GRID.nx * k];
+}
 // plant stems as lines, spaced by stem density (at least a few pixels apart when drawn)
 function buildStems() {
   stems = [];
@@ -334,7 +343,7 @@ function buildStems() {
     for (let x = b.x0 + spacing * hash2(sh.id, 1); x <= b.x1; x += spacing * (0.7 + 0.6 * hash2(sh.id, j++))) {
       let segStart = null;
       for (let z = b.z0; z <= b.z1 + dz; z += dz) {
-        const inside = z <= b.z1 && contains(sh, x, z) && (bedZ(x) <= z);
+        const inside = z <= b.z1 && contains(sh, x, z) && matAt(x, z) === MAT.CANOPY;
         if (inside && segStart === null) segStart = z;
         if (!inside && segStart !== null) { stems.push({ x, z0: segStart, z1: z - dz, lean: (hash2(j, sh.id) - 0.5) * 0.25, id: sh.id }); segStart = null; }
       }
@@ -673,6 +682,7 @@ const HINTS = {
   poly: 'Click to add corners. Click the first corner, double-click or press Enter to close.',
   rect: 'Drag a rectangle.', ellipse: 'Drag an ellipse.',
   erase: 'Drag to carve back to water. It cuts the bed too.',
+  // plants and porous rock fill water only; see rasterize()
   bed: 'Drag a point to reshape the bed. Click the line to add a point, right-click a point to remove it.',
 };
 function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
