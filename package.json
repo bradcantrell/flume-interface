@@ -1,0 +1,11 @@
+{
+  "name": "flume-interface",
+  "private": true,
+  "description": "Dev tools only. The site itself is static and has no build step.",
+  "scripts": {
+    "check": "node dev/interface_checks.js && node dev/model_checks.js"
+  },
+  "devDependencies": {
+    "webgpu": "0.3.8"
+  }
+}

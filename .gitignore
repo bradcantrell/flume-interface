@@ -1,0 +1,5 @@
+node_modules/
+AGENTS.local.md
+DESIGN.md
+spike/
+package-lock.json

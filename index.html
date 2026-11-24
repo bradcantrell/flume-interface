@@ -1,0 +1,852 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flume Interface</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0d1116; --panel: #151b22; --panel2: #1c242d; --line: #2a3440; --text: #d7dee6; --dim: #8796a5;
+    --accent: #f2c14e; --water: #5fc4d8; --danger: #e5735c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #app { display: flex; height: 100%; }
+  #stage { position: relative; flex: 1; min-width: 0; overflow: hidden; background: radial-gradient(ellipse at 50% 40%, #16202a 0%, #0b0f14 75%); }
+  #stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  #ui { touch-action: none; }
+  #banner { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); max-width: 640px; padding: 10px 14px; border-radius: 8px;
+    background: rgba(40, 24, 18, 0.92); border: 1px solid var(--danger); color: #f3d6cf; z-index: 5; }
+  #toolbar { position: absolute; left: 12px; top: 12px; display: flex; gap: 4px; padding: 4px; border-radius: 9px; background: rgba(21, 27, 34, 0.88); border: 1px solid var(--line); z-index: 4; }
+  #toolbar button { width: 34px; height: 34px; border: 0; border-radius: 6px; background: transparent; color: var(--text); cursor: pointer; display: grid; place-items: center; }
+  #toolbar button:hover { background: var(--panel2); }
+  #toolbar button.on { background: var(--accent); color: #1b1408; }
+  #toolbar svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  #hint { position: absolute; left: 12px; bottom: 12px; color: var(--dim); font-size: 12px; pointer-events: none; z-index: 4; text-shadow: 0 1px 2px #000; }
+  aside { width: 290px; flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 12px 14px 20px; }
+  @media (max-width: 900px) { #app { flex-direction: column; } aside { width: 100%; height: 42%; border-left: 0; border-top: 1px solid var(--line); } }
+  h1 { font-size: 15px; margin: 0 0 10px; letter-spacing: 0.02em; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin: 16px 0 6px; font-weight: 600; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 5px 0; }
+  .row label { color: var(--dim); flex: 1; }
+  input[type=number], select { width: 118px; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; font: inherit; }
+  input[type=range] { width: 118px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0; }
+  .btns button, button.wide { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; font: inherit; cursor: pointer; }
+  .btns button:hover, button.wide:hover { border-color: var(--dim); }
+  button.primary { background: var(--accent); color: #1b1408; border-color: var(--accent); font-weight: 600; }
+  #model-controls, #mat-props { display: contents; }
+  #stats { font-variant-numeric: tabular-nums; }
+  #stats .row { margin: 2px 0; }
+  #stats .row span:last-child { color: var(--text); }
+  #keys { color: var(--dim); font-size: 12px; margin-top: 14px; line-height: 1.6; }
+  kbd { background: var(--panel2); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: 11px ui-monospace, monospace; color: var(--text); }
+  .note { color: var(--dim); font-size: 12px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="bg"></canvas>
+    <canvas id="gpu"></canvas>
+    <canvas id="ui"></canvas>
+    <div id="banner" hidden></div>
+    <div id="toolbar">
+      <button data-tool="select" title="Select, move, resize (1)"><svg viewBox="0 0 24 24"><path d="M5 3l14 8-6 2-3 6z"/></svg></button>
+      <button data-tool="brush" title="Brush (2)"><svg viewBox="0 0 24 24"><path d="M4 20c3 0 5-2 5-5l9-9a2 2 0 0 0-3-3l-9 9c-3 0-5 2-2 8z"/></svg></button>
+      <button data-tool="line" title="Line (3)"><svg viewBox="0 0 24 24"><path d="M4 19L20 5"/><circle cx="4" cy="19" r="1.6"/><circle cx="20" cy="5" r="1.6"/></svg></button>
+      <button data-tool="poly" title="Polygon (4)"><svg viewBox="0 0 24 24"><path d="M4 18l4-12 8 2 4 9-9 3z"/></svg></button>
+      <button data-tool="rect" title="Rectangle (5)"><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="10" rx="1"/></svg></button>
+      <button data-tool="ellipse" title="Ellipse (6)"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="5.5"/></svg></button>
+      <button data-tool="erase" title="Eraser, carves water (7)"><svg viewBox="0 0 24 24"><path d="M8 20h12M5 15l8-9 6 6-8 8H9z"/></svg></button>
+      <button data-tool="bed" title="Edit the bed profile (8)"><svg viewBox="0 0 24 24"><path d="M3 16c4-5 6 1 9-3s5-1 9-4"/><circle cx="12" cy="13" r="1.6"/></svg></button>
+    </div>
+    <div id="hint"></div>
+  </div>
+  <aside>
+    <h1>Flume Interface</h1>
+    <div class="btns">
+      <button id="run" class="primary">run</button>
+      <button id="restart">restart</button>
+      <select id="speed" title="model seconds per real second"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>real time</option><option value="2">2× speed</option><option value="4">4× speed</option></select>
+    </div>
+
+    <h2>Water</h2>
+    <div id="model-controls"></div>
+
+    <h2>Flume</h2>
+    <div class="row"><label for="scale">scale</label><select id="scale"><option value="lab">lab</option><option value="field">field</option></select></div>
+    <div class="row"><label for="len">length (m)</label><input id="len" type="number" step="any" min="0.5"></div>
+    <div class="row"><label for="hgt">height (m)</label><input id="hgt" type="number" step="any" min="0.05"></div>
+    <div class="row"><label for="res">resolution</label><select id="res"><option value="draft">draft</option><option value="normal">normal</option><option value="fine">fine</option></select></div>
+
+    <h2>Material</h2>
+    <div class="row"><label for="mat">draw with</label><select id="mat"></select></div>
+    <div id="mat-props"></div>
+    <div class="row"><label for="brush">brush width</label><input id="brush" type="range" min="2" max="80" value="14"></div>
+    <p class="note" id="sel-note"></p>
+
+    <h2>Bed</h2>
+    <div class="row"><label for="bed-cls">bed sediment</label><select id="bed-cls"></select></div>
+    <div class="row"><label for="bed-slope">slope (%)</label><input id="bed-slope" type="number" step="0.1" value="0"></div>
+    <div class="btns"><button id="bed-flat">flat</button><button id="bed-apply-slope">apply slope</button><button id="bed-smooth">smooth</button></div>
+
+    <h2>Scene</h2>
+    <div class="btns">
+      <button id="undo">undo</button><button id="save">save</button><button id="open">open</button><button id="clear">clear</button>
+      <input id="open-file" type="file" accept=".json,application/json" hidden>
+    </div>
+    <div id="site-slot"></div>
+
+    <h2>Readouts</h2>
+    <div id="stats"></div>
+
+    <div id="keys">
+      <kbd>Space</kbd> run/pause &middot; <kbd>R</kbd> restart &middot; <kbd>1</kbd>–<kbd>8</kbd> tools<br>
+      <kbd>Del</kbd> delete shape &middot; <kbd>[</kbd> <kbd>]</kbd> send back/forward<br>
+      <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo &middot; <kbd>Esc</kbd> cancel<br>
+      wheel zoom &middot; middle-drag or arrows pan &middot; <kbd>Alt</kbd>+wheel vertical scale &middot; <kbd>0</kbd> fit
+      <span id="help-site"></span>
+    </div>
+  </aside>
+</div>
+
+<script id="interface">
+'use strict';
+// ═════════════════════════════════════════════════════════════════════════════
+// FLUME INTERFACE
+// The section view, the drawing tools, the material raster, the bed and the scene.
+// It knows nothing about how water moves: that is model.js, through the MODEL EXTENSION
+// POINT at the end of this script. What a repo does with the scene is site.js (SITE
+// EXTENSION POINT).
+//
+// World coordinates are metres: x along the flume (0..L), z up from the floor (0..H).
+// Shapes are kept as vectors in metres and are the source of truth; the grid (GRID, RASTER)
+// is rasterized from them, so changing resolution or scale loses nothing.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ───────── materials ─────────
+const MAT = { FLUID: 0, SOLID: 1, POROUS: 2, CANOPY: 3, SEDIMENT: 4 };
+const GRAIN = [
+  { label: 'fine sand', d: 0.0002, color: [214, 193, 150] },
+  { label: 'coarse sand', d: 0.001, color: [190, 150, 88] },
+  { label: 'gravel', d: 0.01, color: [132, 120, 106] },
+];
+// props: [key, label, min, max, step, lab default, field default]
+const MAT_INFO = {
+  1: { label: 'solid', props: [] },
+  2: { label: 'porous (rock, reef)', props: [['n', 'porosity', 0.1, 0.9, 0.01, 0.4, 0.4], ['d', 'stone size (m)', 0.001, 5, 0.001, 0.04, 0.8]] },
+  3: { label: 'plants (canopy)', props: [['a', 'frontal area (1/m)', 0.1, 200, 0.1, 8, 1.5], ['cd', 'drag coefficient', 0.2, 3, 0.05, 1.0, 1.0], ['stem', 'stem diameter (m)', 0.0005, 1, 0.0005, 0.006, 0.05]] },
+  4: { label: 'sediment', props: [['cls', 'grain class', 0, 2, 1, 0, 0]] },
+};
+
+// ───────── domain and grid ─────────
+const RES_FACTOR = { draft: 2, normal: 1.4, fine: 1 };
+let DOMAIN = { scale: 'lab', L: 20, H: 1.0, res: 'normal' };
+let GRID = null;          // { nx, nz, dx }
+let RASTER = null;        // { nx, nz, dx, mat: Uint8, p1, p2, p3: Float32, cls: Uint8 }
+
+function domainDefaults(scale) {
+  if (model && model.domain) return model.domain(scale);
+  return scale === 'field' ? { L: 400, H: 16, dx: 0.2 } : { L: 20, H: 1.0, dx: 0.01 };
+}
+function gridFor(dom) {
+  const base = domainDefaults(dom.scale).dx * (RES_FACTOR[dom.res] || 1.4);
+  const nx = Math.max(16, Math.round(dom.L / base));
+  const dx = dom.L / nx;
+  const nz = Math.max(8, Math.round(dom.H / dx));
+  return { nx, nz, dx };
+}
+
+// ───────── scene ─────────
+// shapes: { id, kind: 'rect'|'ellipse'|'poly'|'stroke', pts: [[x,z],...], w (stroke width, m),
+//           mat, props: {...} }. rect and ellipse keep two corner points.
+let scene = { bed: { pts: [[0, 0.1], [20, 0.1]], cls: 0 }, shapes: [] };
+let nextId = 1;
+
+function defaultBed(dom) { const z = +(dom.H * 0.1).toFixed(4); return { pts: [[0, z], [dom.L, z]], cls: 0 }; }
+function bedZ(x) {
+  const p = scene.bed.pts;
+  if (x <= p[0][0]) return p[0][1];
+  for (let j = 1; j < p.length; j++) if (x <= p[j][0]) { const a = p[j - 1], b = p[j], t = (x - a[0]) / Math.max(b[0] - a[0], 1e-9); return a[1] + t * (b[1] - a[1]); }
+  return p[p.length - 1][1];
+}
+function propDefaults(mat) {
+  const info = MAT_INFO[mat], o = {}; if (!info) return o;
+  for (const pr of info.props) o[pr[0]] = DOMAIN.scale === 'field' ? pr[6] : pr[5];
+  return o;
+}
+
+// ───────── geometry ─────────
+function bboxOf(sh) {
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  for (const [x, z] of sh.pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
+  const h = sh.kind === 'stroke' ? (sh.w || 0) / 2 : 0;
+  return { x0: x0 - h, z0: z0 - h, x1: x1 + h, z1: z1 + h };
+}
+function distSeg(px, pz, a, b) {
+  const vx = b[0] - a[0], vz = b[1] - a[1], L2 = vx * vx + vz * vz;
+  let t = L2 > 0 ? ((px - a[0]) * vx + (pz - a[1]) * vz) / L2 : 0; t = Math.max(0, Math.min(1, t));
+  const dx = px - (a[0] + t * vx), dz = pz - (a[1] + t * vz); return Math.sqrt(dx * dx + dz * dz);
+}
+function contains(sh, x, z) {
+  const p = sh.pts;
+  if (sh.kind === 'rect') { const x0 = Math.min(p[0][0], p[1][0]), x1 = Math.max(p[0][0], p[1][0]), z0 = Math.min(p[0][1], p[1][1]), z1 = Math.max(p[0][1], p[1][1]); return x >= x0 && x <= x1 && z >= z0 && z <= z1; }
+  if (sh.kind === 'ellipse') {
+    const cx = (p[0][0] + p[1][0]) / 2, cz = (p[0][1] + p[1][1]) / 2, rx = Math.abs(p[1][0] - p[0][0]) / 2, rz = Math.abs(p[1][1] - p[0][1]) / 2;
+    if (rx <= 0 || rz <= 0) return false; const u = (x - cx) / rx, v = (z - cz) / rz; return u * u + v * v <= 1;
+  }
+  if (sh.kind === 'poly') {
+    let inside = false;
+    for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+      const xi = p[i][0], zi = p[i][1], xj = p[j][0], zj = p[j][1];
+      if ((zi > z) !== (zj > z) && x < (xj - xi) * (z - zi) / (zj - zi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+  if (sh.kind === 'stroke') {
+    const r = (sh.w || 0) / 2;
+    if (p.length === 1) return Math.hypot(x - p[0][0], z - p[0][1]) <= r;
+    for (let j = 1; j < p.length; j++) if (distSeg(x, z, p[j - 1], p[j]) <= r) return true;
+    return false;
+  }
+  return false;
+}
+
+// ───────── raster ─────────
+function rasterize() {
+  const { nx, nz, dx } = GRID, N = nx * nz;
+  if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
+  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.cls.fill(0);
+  // the bed: everything under the profile is sediment of the bed's class
+  for (let i = 0; i < nx; i++) {
+    const zb = bedZ((i + 0.5) * dx), kb = Math.min(nz, Math.round(zb / dx));
+    for (let k = 0; k < kb; k++) { const c = i + nx * k; R.mat[c] = MAT.SEDIMENT; R.cls[c] = scene.bed.cls; }
+  }
+  // shapes, in order: later shapes cover earlier ones; the eraser writes water
+  for (const sh of scene.shapes) {
+    const b = bboxOf(sh);
+    const i0 = Math.max(0, Math.floor(b.x0 / dx - 0.5)), i1 = Math.min(nx - 1, Math.ceil(b.x1 / dx - 0.5));
+    const k0 = Math.max(0, Math.floor(b.z0 / dx - 0.5)), k1 = Math.min(nz - 1, Math.ceil(b.z1 / dx - 0.5));
+    const pr = sh.props || {};
+    for (let k = k0; k <= k1; k++) for (let i = i0; i <= i1; i++) {
+      if (!contains(sh, (i + 0.5) * dx, (k + 0.5) * dx)) continue;
+      const c = i + nx * k; R.mat[c] = sh.mat; R.p1[c] = 0; R.p2[c] = 0; R.p3[c] = 0; R.cls[c] = 0;
+      if (sh.mat === MAT.POROUS) { R.p1[c] = pr.n; R.p2[c] = pr.d; }
+      else if (sh.mat === MAT.CANOPY) { R.p1[c] = pr.a; R.p2[c] = pr.cd; R.p3[c] = pr.stem; }
+      else if (sh.mat === MAT.SEDIMENT) { R.cls[c] = pr.cls | 0; }
+    }
+  }
+  return R;
+}
+function rasterHash() { let h = 2166136261; const m = RASTER.mat, c = RASTER.cls; for (let i = 0; i < m.length; i++) { h ^= m[i] * 7 + c[i]; h = Math.imul(h, 16777619); } return h >>> 0; }
+
+// ───────── view ─────────
+// screen (CSS px) = ((x - x0) * s, ch - (z - z0) * s * ve)
+let view = { x0: 0, z0: 0, s: 50, ve: 1, cw: 800, ch: 400, dpr: 1 };
+let viewFitted = true;
+function fitView() {
+  const { L, H } = DOMAIN, cw = view.cw, ch = view.ch;
+  const s = cw / (L * 1.04);
+  const ve = Math.max(1, Math.min(40, (ch * 0.62) / (H * s)));
+  view.s = s; view.ve = +ve.toFixed(ve < 10 ? 1 : 0);
+  view.x0 = -0.02 * L; view.z0 = -(ch / (s * view.ve) - H) / 2;
+  viewFitted = true;
+}
+function w2s(x, z) { return [(x - view.x0) * view.s, view.ch - (z - view.z0) * view.s * view.ve]; }
+function s2w(X, Y) { return [view.x0 + X / view.s, view.z0 + (view.ch - Y) / (view.s * view.ve)]; }
+function zoomAt(X, Y, factor) {
+  const [x, z] = s2w(X, Y);
+  view.s = Math.max(view.cw / (DOMAIN.L * 4), Math.min(view.s * factor, 20 * view.cw / Math.max(GRID.dx * 40, 1e-6)));
+  view.x0 = x - X / view.s; view.z0 = z - (view.ch - Y) / (view.s * view.ve); viewFitted = false;
+}
+function setVE(X, Y, factor) {
+  const [, z] = s2w(X, Y);
+  view.ve = Math.max(1, Math.min(60, view.ve * factor)); view.z0 = z - (view.ch - Y) / (view.s * view.ve); viewFitted = false;
+}
+
+// ───────── state ─────────
+let tool = 'select';
+let curMat = MAT.SOLID;
+let curProps = { 1: {}, 2: propDefaults(2), 3: propDefaults(3), 4: propDefaults(4) };
+let selected = null;          // shape id
+let drag = null;              // current pointer action
+let polyPts = null;           // polygon being drawn
+let running = false;
+let undoStack = [];
+let lastFrame = 0;
+const STORE_KEY = 'flume-interface-scene';
+
+function shapeById(id) { return scene.shapes.find(s => s.id === id) || null; }
+function snapshot() { return JSON.stringify({ bed: scene.bed, shapes: scene.shapes }); }
+function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 80) undoStack.shift(); }
+function undo() {
+  if (!undoStack.length) return;
+  const s = JSON.parse(undoStack.pop()); scene.bed = s.bed; scene.shapes = s.shapes;
+  if (selected && !shapeById(selected)) selected = null;
+  sceneChanged();
+}
+
+// Every edit ends here: rebuild the raster, tell the model, redraw the materials, save.
+function sceneChanged() {
+  rasterize();
+  if (model && model.setRaster) model.setRaster(RASTER);
+  buildMatImage(); buildStems();
+  saveLocal(); updatePanel();
+}
+
+// ───────── material image (one pixel per cell) ─────────
+let matCanvas = null, matCtx = null, stems = [];
+function hash2(i, k) { const s = Math.sin(i * 127.1 + k * 311.7) * 43758.5453; return s - Math.floor(s); }
+function buildMatImage() {
+  const { nx, nz } = GRID;
+  if (!matCanvas) { matCanvas = document.createElement('canvas'); }
+  if (matCanvas.width !== nx || matCanvas.height !== nz) { matCanvas.width = nx; matCanvas.height = nz; }
+  matCtx = matCanvas.getContext('2d', { willReadFrequently: true });   // a CPU canvas: a GPU reset cannot wipe it
+  const img = matCtx.createImageData(nx, nz), d = img.data, R = RASTER;
+  for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) {
+    const c = i + nx * k, o = 4 * (i + nx * (nz - 1 - k)), m = R.mat[c];
+    let r = 0, g = 0, b = 0, a = 0;
+    if (m === MAT.SOLID) { const n = (hash2(i, k) - 0.5) * 10; r = 74 + n; g = 80 + n; b = 89 + n; a = 255; }
+    else if (m === MAT.SEDIMENT) {
+      const gr = GRAIN[R.cls[c]] || GRAIN[0], sc = R.cls[c] === 2 ? 3 : R.cls[c] === 1 ? 2 : 1;
+      const n = (hash2(Math.floor(i / sc), Math.floor(k / sc)) - 0.5) * (R.cls[c] === 2 ? 46 : 22) + (hash2(i, k) - 0.5) * 8;
+      r = gr.color[0] + n; g = gr.color[1] + n; b = gr.color[2] + n; a = 255;
+    } else if (m === MAT.POROUS) {
+      const cps = Math.max(1, (R.p2[c] || 0.04) / GRID.dx), q = hash2(Math.floor(i / cps), Math.floor(k / cps));
+      if (q > (R.p1[c] || 0.4)) { const n = (q - 0.5) * 40 + (hash2(i, k) - 0.5) * 10; r = 128 + n; g = 118 + n; b = 104 + n; a = 240; }
+      else { r = 30; g = 40; b = 46; a = 60; }
+    } else if (m === MAT.CANOPY) { r = 70; g = 150; b = 80; a = 30; }
+    d[o] = r; d[o + 1] = g; d[o + 2] = b; d[o + 3] = a;
+  }
+  matCtx.putImageData(img, 0, 0);
+}
+// plant stems as lines, spaced by stem density (at least a few pixels apart when drawn)
+function buildStems() {
+  stems = [];
+  for (const sh of scene.shapes) {
+    if (sh.mat !== MAT.CANOPY) continue;
+    const b = bboxOf(sh), pr = sh.props || {}, a = Math.max(pr.a || 8, 0.01), stem = Math.max(pr.stem || 0.006, 1e-4);
+    const spacing = Math.max(Math.sqrt(stem / a), GRID.dx * 0.75);   // stems per area = a / stem
+    const dz = GRID.dx * 0.5;
+    let j = 0;
+    for (let x = b.x0 + spacing * hash2(sh.id, 1); x <= b.x1; x += spacing * (0.7 + 0.6 * hash2(sh.id, j++))) {
+      let segStart = null;
+      for (let z = b.z0; z <= b.z1 + dz; z += dz) {
+        const inside = z <= b.z1 && contains(sh, x, z) && (bedZ(x) <= z);
+        if (inside && segStart === null) segStart = z;
+        if (!inside && segStart !== null) { stems.push({ x, z0: segStart, z1: z - dz, lean: (hash2(j, sh.id) - 0.5) * 0.25, id: sh.id }); segStart = null; }
+      }
+    }
+  }
+}
+
+// ───────── drawing ─────────
+let bgCtx, uiCtx, cvBg, cvGpu, cvUi;
+function resize() {
+  const st = document.getElementById('stage'), r = st.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  view.cw = Math.max(320, r.width); view.ch = Math.max(200, r.height); view.dpr = dpr;
+  for (const cv of [cvBg, cvGpu, cvUi]) { cv.width = Math.round(view.cw * dpr); cv.height = Math.round(view.ch * dpr); }
+  if (viewFitted) fitView();
+}
+function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
+function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
+
+function drawBackground() {
+  const c = bgCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, view.cw, view.ch);
+  const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
+  // the flume interior: dark glass with a faint metric grid
+  const gr = c.createLinearGradient(0, Y0, 0, Y1); gr.addColorStop(0, '#1a232c'); gr.addColorStop(1, '#121920');
+  c.fillStyle = gr; c.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+  c.save(); c.beginPath(); c.rect(X0, Y0, X1 - X0, Y1 - Y0); c.clip();
+  const sx = niceStep(70 / view.s), sz = niceStep(50 / (view.s * view.ve));
+  c.strokeStyle = 'rgba(160,190,215,0.06)'; c.lineWidth = 1; c.beginPath();
+  for (let x = Math.ceil(Math.max(0, view.x0) / sx) * sx; x <= DOMAIN.L; x += sx) { const X = Math.round(w2s(x, 0)[0]) + 0.5; c.moveTo(X, Y0); c.lineTo(X, Y1); }
+  for (let z = 0; z <= DOMAIN.H; z += sz) { const Y = Math.round(w2s(0, z)[1]) + 0.5; c.moveTo(X0, Y); c.lineTo(X1, Y); }
+  c.stroke(); c.restore();
+}
+function drawUI(now) {
+  const c = uiCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, view.cw, view.ch);
+  const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
+  // materials
+  c.imageSmoothingEnabled = view.s * GRID.dx < 2.5;
+  if (matCanvas) c.drawImage(matCanvas, X0, Y0, X1 - X0, Y1 - Y0);
+  // plant stems
+  if (stems.length) {
+    c.strokeStyle = 'rgba(132, 200, 110, 0.85)'; c.lineWidth = Math.max(1, Math.min(2.2, view.s * GRID.dx * 0.5)); c.beginPath();
+    for (const st of stems) { const [Xa, Ya] = w2s(st.x, st.z0), [, Yb] = w2s(st.x, st.z1); c.moveTo(Xa, Ya); c.lineTo(Xa + st.lean * (Ya - Yb) * 0.2, Yb); }
+    c.stroke();
+  }
+  // flume walls
+  c.strokeStyle = 'rgba(200, 215, 230, 0.55)'; c.lineWidth = 1.5; c.strokeRect(X0, Y0, X1 - X0, Y1 - Y0);
+  // bed profile in bed mode
+  if (tool === 'bed') {
+    c.strokeStyle = '#f2c14e'; c.lineWidth = 1.5; c.beginPath();
+    scene.bed.pts.forEach(([x, z], j) => { const [X, Y] = w2s(x, z); j ? c.lineTo(X, Y) : c.moveTo(X, Y); }); c.stroke();
+    for (const [x, z] of scene.bed.pts) { const [X, Y] = w2s(x, z); c.fillStyle = '#f2c14e'; c.beginPath(); c.arc(X, Y, 4.5, 0, 6.2832); c.fill(); }
+  }
+  // shape outlines in select mode, the selection with handles
+  if (tool === 'select') {
+    c.setLineDash([3, 3]); c.strokeStyle = 'rgba(255,255,255,0.18)'; c.lineWidth = 1;
+    for (const sh of scene.shapes) if (sh.id !== selected) outline(c, sh);
+    c.setLineDash([]);
+  }
+  const sel = shapeById(selected);
+  if (sel) {
+    c.strokeStyle = '#f2c14e'; c.lineWidth = 1.5; outline(c, sel);
+    for (const h of handlesOf(sel)) { c.fillStyle = '#0d1116'; c.strokeStyle = '#f2c14e'; c.beginPath(); c.rect(h.X - 4, h.Y - 4, 8, 8); c.fill(); c.stroke(); }
+  }
+  // in-progress shape
+  if (drag && drag.preview) { c.strokeStyle = '#f2c14e'; c.fillStyle = 'rgba(242,193,78,0.18)'; c.lineWidth = 1.5; outline(c, drag.preview, true); }
+  if (polyPts && polyPts.length) {
+    c.strokeStyle = '#f2c14e'; c.lineWidth = 1.5; c.beginPath();
+    polyPts.forEach(([x, z], j) => { const [X, Y] = w2s(x, z); j ? c.lineTo(X, Y) : c.moveTo(X, Y); });
+    if (hover) { const [X, Y] = w2s(hover[0], hover[1]); c.lineTo(X, Y); } c.stroke();
+    for (const [x, z] of polyPts) { const [X, Y] = w2s(x, z); c.fillStyle = '#f2c14e'; c.fillRect(X - 3, Y - 3, 6, 6); }
+  }
+  // brush cursor
+  if (hover && (tool === 'brush' || tool === 'erase' || tool === 'line')) {
+    const [X, Y] = w2s(hover[0], hover[1]); c.strokeStyle = tool === 'erase' ? 'rgba(120,210,235,0.9)' : 'rgba(242,193,78,0.9)'; c.lineWidth = 1;
+    c.beginPath(); c.ellipse(X, Y, brushPx() / 2, brushPx() / 2 * view.ve, 0, 0, 6.2832); c.stroke();
+  }
+  drawScale(c);
+}
+function outline(c, sh, fill) {
+  const p = sh.pts.map(([x, z]) => w2s(x, z));
+  c.beginPath();
+  if (sh.kind === 'rect') { c.rect(Math.min(p[0][0], p[1][0]), Math.min(p[0][1], p[1][1]), Math.abs(p[1][0] - p[0][0]), Math.abs(p[1][1] - p[0][1])); }
+  else if (sh.kind === 'ellipse') { c.ellipse((p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2, Math.abs(p[1][0] - p[0][0]) / 2, Math.abs(p[1][1] - p[0][1]) / 2, 0, 0, 6.2832); }
+  else if (sh.kind === 'poly') { p.forEach(([X, Y], j) => j ? c.lineTo(X, Y) : c.moveTo(X, Y)); c.closePath(); }
+  else if (sh.kind === 'stroke') {
+    c.save(); c.lineWidth = Math.max(1, (sh.w || 0) * view.s); c.lineCap = 'round'; c.lineJoin = 'round';
+    c.setTransform(view.dpr, 0, 0, view.dpr * view.ve, 0, 0);        // width in metres is the same in x and z
+    p.forEach(([X, Y], j) => j ? c.lineTo(X, Y / view.ve) : c.moveTo(X, Y / view.ve));
+    if (p.length === 1) c.lineTo(p[0][0] + 0.01, p[0][1] / view.ve);
+    c.strokeStyle = fill ? 'rgba(242,193,78,0.35)' : 'rgba(242,193,78,0.28)'; c.stroke(); c.restore(); return;
+  }
+  if (fill) c.fill(); c.stroke();
+}
+function drawScale(c) {
+  const len = niceStep(110 / view.s), px = len * view.s, X = view.cw - px - 24, Y = view.ch - 22;
+  c.strokeStyle = 'rgba(215,222,230,0.8)'; c.fillStyle = 'rgba(215,222,230,0.85)'; c.lineWidth = 1.5;
+  c.beginPath(); c.moveTo(X, Y - 4); c.lineTo(X, Y); c.lineTo(X + px, Y); c.lineTo(X + px, Y - 4); c.stroke();
+  c.font = '11px system-ui, sans-serif'; c.textAlign = 'center'; c.fillText(fmtLen(len), X + px / 2, Y - 7);
+  c.textAlign = 'right'; c.fillStyle = 'rgba(135,150,165,0.95)';
+  c.fillText(view.ve > 1.05 ? 'vertical × ' + (+view.ve.toFixed(1)) : 'true scale', view.cw - 24, Y + 14);
+}
+function brushPx() { return +document.getElementById('brush').value; }
+function brushW() { return brushPx() / view.s; }
+
+// ───────── pointer tools ─────────
+let hover = null;
+function handlesOf(sh) {
+  const b = bboxOf(sh), [Xa, Ya] = w2s(b.x0, b.z1), [Xb, Yb] = w2s(b.x1, b.z0), Xm = (Xa + Xb) / 2, Ym = (Ya + Yb) / 2;
+  return [
+    { X: Xa, Y: Ya, fx: 1, fz: 1, ax: 'x1', az: 'z0' }, { X: Xm, Y: Ya, fx: 0, fz: 1, az: 'z0' }, { X: Xb, Y: Ya, fx: 1, fz: 1, ax: 'x0', az: 'z0' },
+    { X: Xa, Y: Ym, fx: 1, fz: 0, ax: 'x1' }, { X: Xb, Y: Ym, fx: 1, fz: 0, ax: 'x0' },
+    { X: Xa, Y: Yb, fx: 1, fz: 1, ax: 'x1', az: 'z1' }, { X: Xm, Y: Yb, fx: 0, fz: 1, az: 'z1' }, { X: Xb, Y: Yb, fx: 1, fz: 1, ax: 'x0', az: 'z1' },
+  ];
+}
+function hitShape(x, z) {
+  for (let j = scene.shapes.length - 1; j >= 0; j--) { const sh = scene.shapes[j]; if (contains(sh, x, z)) return sh; }
+  // thin shapes: within 5 px of the outline counts
+  const tol = 5 / view.s;
+  for (let j = scene.shapes.length - 1; j >= 0; j--) { const sh = scene.shapes[j], b = bboxOf(sh); if (x >= b.x0 - tol && x <= b.x1 + tol && z >= b.z0 - tol / view.ve && z <= b.z1 + tol / view.ve && sh.kind === 'stroke') return sh; }
+  return null;
+}
+function transformShape(sh, base, fn) { sh.pts = base.pts.map(([x, z]) => fn(x, z)); }
+function clampX(x) { return Math.max(0, Math.min(DOMAIN.L, x)); }
+function clampZ(z) { return Math.max(0, Math.min(DOMAIN.H, z)); }
+
+function onDown(e) {
+  const X = e.offsetX, Y = e.offsetY, [x, z] = s2w(X, Y);
+  if (e.button === 1 || (e.button === 0 && e.altKey && tool !== 'poly')) { drag = { kind: 'pan', X, Y, x0: view.x0, z0: view.z0 }; return; }
+  if (e.button === 2) {
+    if (tool === 'bed') bedDeleteNear(X, Y);
+    if (tool === 'poly') { polyPts = null; }
+    return;
+  }
+  if (tool === 'select') {
+    const sel = shapeById(selected);
+    if (sel) for (const h of handlesOf(sel)) if (Math.abs(h.X - X) < 7 && Math.abs(h.Y - Y) < 7) {
+      pushUndo(); drag = { kind: 'resize', h, base: JSON.parse(JSON.stringify(sel)), bb: bboxOf(sel) }; return;
+    }
+    const hit = hitShape(x, z);
+    selected = hit ? hit.id : null; updatePanel();
+    if (hit) { pushUndo(); drag = { kind: 'move', x, z, base: JSON.parse(JSON.stringify(hit)), moved: false }; }
+    return;
+  }
+  if (tool === 'brush' || tool === 'erase') { drag = { kind: 'stroke', preview: { kind: 'stroke', pts: [[x, z]], w: brushW() } }; return; }
+  if (tool === 'line') { drag = { kind: 'line', preview: { kind: 'stroke', pts: [[x, z], [x, z]], w: brushW() } }; return; }
+  if (tool === 'rect' || tool === 'ellipse') { drag = { kind: 'box', preview: { kind: tool, pts: [[x, z], [x, z]] } }; return; }
+  if (tool === 'poly') {
+    if (!polyPts) polyPts = [];
+    if (polyPts.length >= 3) { const [Xf, Yf] = w2s(polyPts[0][0], polyPts[0][1]); if (Math.hypot(X - Xf, Y - Yf) < 8) { finishPoly(); return; } }
+    polyPts.push([x, z]); return;
+  }
+  if (tool === 'bed') {
+    let best = -1, bd = 9;
+    scene.bed.pts.forEach(([bx, bz], j) => { const [Xb, Yb] = w2s(bx, bz); const d = Math.hypot(Xb - X, Yb - Y); if (d < bd) { bd = d; best = j; } });
+    if (best < 0) {
+      // a click near the profile adds a point there
+      const [, Yl] = w2s(x, bedZ(x));
+      if (Math.abs(Yl - Y) < 10 && x > 0 && x < DOMAIN.L) { pushUndo(); best = bedInsert(x, bedZ(x)); }
+    } else pushUndo();
+    if (best >= 0) drag = { kind: 'bed', j: best };
+  }
+}
+function onMove(e) {
+  const X = e.offsetX, Y = e.offsetY, [x, z] = s2w(X, Y);
+  hover = [x, z];
+  if (!drag) return;
+  if (drag.kind === 'pan') { view.x0 = drag.x0 - (X - drag.X) / view.s; view.z0 = drag.z0 + (Y - drag.Y) / (view.s * view.ve); viewFitted = false; return; }
+  if (drag.kind === 'move') {
+    const sh = shapeById(selected); if (!sh) return; drag.moved = true;
+    const dx = x - drag.x, dz = z - drag.z; transformShape(sh, drag.base, (px, pz) => [px + dx, pz + dz]); return;
+  }
+  if (drag.kind === 'resize') {
+    const sh = shapeById(selected); if (!sh) return; const b = drag.bb, h = drag.h;
+    const ax = h.ax === 'x0' ? b.x0 : b.x1, az = h.az === 'z0' ? b.z0 : b.z1;
+    const sx = h.fx ? (x - ax) / ((h.ax === 'x0' ? b.x1 : b.x0) - ax || 1e-9) : 1;
+    const sz = h.fz ? (z - az) / ((h.az === 'z0' ? b.z1 : b.z0) - az || 1e-9) : 1;
+    const AX = h.fx ? ax : 0, AZ = h.fz ? az : 0;
+    transformShape(sh, drag.base, (px, pz) => [AX + (px - AX) * (h.fx ? sx : 1), AZ + (pz - AZ) * (h.fz ? sz : 1)]);
+    if (sh.kind === 'stroke') sh.w = drag.base.w * Math.sqrt(Math.abs((h.fx ? sx : 1) * (h.fz ? sz : 1))) || drag.base.w;
+    return;
+  }
+  if (drag.kind === 'stroke') { const p = drag.preview.pts, last = p[p.length - 1]; if (Math.hypot((x - last[0]) * view.s, (z - last[1]) * view.s * view.ve) > 3) p.push([x, z]); return; }
+  if (drag.kind === 'line' || drag.kind === 'box') { drag.preview.pts[1] = [x, z]; return; }
+  if (drag.kind === 'bed') {
+    const p = scene.bed.pts, j = drag.j, last = p.length - 1;
+    const xn = j === 0 ? 0 : j === last ? DOMAIN.L : Math.max(p[j - 1][0] + GRID.dx, Math.min(p[j + 1][0] - GRID.dx, x));
+    p[j] = [xn, clampZ(z)]; return;
+  }
+}
+function onUp() {
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (d.kind === 'move') { if (d.moved) sceneChanged(); else undoStack.pop(); return; }
+  if (d.kind === 'resize' || d.kind === 'bed') { sceneChanged(); return; }
+  if (d.kind === 'stroke' || d.kind === 'line' || d.kind === 'box') {
+    const pv = d.preview, b = bboxOf(pv);
+    if (d.kind === 'box' && (Math.abs(b.x1 - b.x0) * view.s < 3 || Math.abs(b.z1 - b.z0) * view.s * view.ve < 3)) return;
+    addShape(pv.kind, pv.pts, pv.w);
+  }
+}
+function addShape(kind, pts, w) {
+  pushUndo();
+  const mat = tool === 'erase' ? MAT.FLUID : curMat;
+  const sh = { id: nextId++, kind, pts: pts.map(p => [+p[0].toFixed(5), +p[1].toFixed(5)]), mat, props: Object.assign({}, curProps[mat] || {}) };
+  if (kind === 'stroke') sh.w = +w.toFixed(5);
+  scene.shapes.push(sh); sceneChanged(); return sh;
+}
+function finishPoly() { if (polyPts && polyPts.length >= 3) addShape('poly', polyPts); polyPts = null; }
+function bedInsert(x, z) { const p = scene.bed.pts; let j = 1; while (j < p.length && p[j][0] < x) j++; p.splice(j, 0, [x, z]); return j; }
+function bedDeleteNear(X, Y) {
+  const p = scene.bed.pts;
+  for (let j = 1; j < p.length - 1; j++) { const [Xb, Yb] = w2s(p[j][0], p[j][1]); if (Math.hypot(Xb - X, Yb - Y) < 9) { pushUndo(); p.splice(j, 1); sceneChanged(); return; } }
+}
+function bedFlat() { pushUndo(); const z = scene.bed.pts[0][1]; scene.bed.pts = [[0, z], [DOMAIN.L, z]]; sceneChanged(); }
+// a slope pivots about the bed's mean height, so the design stays where it was
+function bedSlope(pct) {
+  pushUndo(); let m = 0; const n = 50; for (let j = 0; j <= n; j++) m += bedZ(DOMAIN.L * j / n) / (n + 1);
+  const drop = pct / 100 * DOMAIN.L; scene.bed.pts = [[0, clampZ(m + drop / 2)], [DOMAIN.L, clampZ(m - drop / 2)]]; sceneChanged();
+}
+function bedSmooth() {
+  const p = scene.bed.pts; if (p.length < 3) return; pushUndo();
+  // densify to ~40 points, then a few passes of neighbour averaging (ends stay put)
+  const n = Math.max(p.length, 40), q = [];
+  for (let j = 0; j < n; j++) { const x = DOMAIN.L * j / (n - 1); q.push([x, bedZ(x)]); }
+  for (let pass = 0; pass < 3; pass++) for (let j = 1; j < q.length - 1; j++) q[j][1] = (q[j - 1][1] + 2 * q[j][1] + q[j + 1][1]) / 4;
+  scene.bed.pts = q.map(([x, z]) => [+x.toFixed(4), +z.toFixed(4)]); sceneChanged();
+}
+function deleteSelected() { if (!selected) return; pushUndo(); scene.shapes = scene.shapes.filter(s => s.id !== selected); selected = null; sceneChanged(); }
+function reorderSelected(dir) {
+  const j = scene.shapes.findIndex(s => s.id === selected); if (j < 0) return;
+  const k = Math.max(0, Math.min(scene.shapes.length - 1, j + dir)); if (k === j) return;
+  pushUndo(); const [s] = scene.shapes.splice(j, 1); scene.shapes.splice(k, 0, s); sceneChanged();
+}
+
+// ───────── domain changes ─────────
+// A new length or height stretches the scene with it (shapes, bed), so a design keeps its place.
+function setDomain(next, stretch = true) {
+  const old = Object.assign({}, DOMAIN);
+  DOMAIN = Object.assign({}, DOMAIN, next);
+  if (stretch && (old.L !== DOMAIN.L || old.H !== DOMAIN.H)) {
+    const fx = DOMAIN.L / old.L, fz = DOMAIN.H / old.H, fw = Math.sqrt(fx * fz);
+    for (const sh of scene.shapes) { sh.pts = sh.pts.map(([x, z]) => [x * fx, z * fz]); if (sh.w) sh.w *= fw; }
+    scene.bed.pts = scene.bed.pts.map(([x, z]) => [x * fx, z * fz]);
+  }
+  scene.bed.pts[0][0] = 0; scene.bed.pts[scene.bed.pts.length - 1][0] = DOMAIN.L;
+  GRID = gridFor(DOMAIN);
+  rasterize();
+  if (model && model.setGrid) model.setGrid(GRID, RASTER);
+  if (model && model.reset) model.reset();
+  buildMatImage(); buildStems(); fitView(); syncDomainInputs(); saveLocal();
+}
+function setScale(scale) {
+  if (scale === DOMAIN.scale) return;
+  const d = domainDefaults(scale);
+  if (model && model.setScale) model.setScale(scale);
+  // properties that carry a length move to the new scale's defaults
+  for (const m of [2, 3, 4]) curProps[m] = Object.assign(propDefaultsFor(m, scale));
+  for (const sh of scene.shapes) if (MAT_INFO[sh.mat]) for (const pr of MAT_INFO[sh.mat].props) if (pr[0] !== 'cls' && pr[0] !== 'n' && pr[0] !== 'cd') sh.props[pr[0]] = scale === 'field' ? pr[6] : pr[5];
+  setDomain({ scale, L: d.L, H: d.H });
+}
+function propDefaultsFor(m, scale) { const s = DOMAIN.scale; DOMAIN.scale = scale; const o = propDefaults(m); DOMAIN.scale = s; return o; }
+
+// ───────── save / open ─────────
+function captureScene() {
+  return { app: 'flume-interface', version: 1, domain: DOMAIN, bed: scene.bed, shapes: scene.shapes, model: model && model.state ? model.state() : null };
+}
+function sceneFileText() { return JSON.stringify(captureScene(), null, 1) + '\n'; }
+function validScene(s) {
+  if (!s || s.app !== 'flume-interface' || !s.domain || !s.bed || !Array.isArray(s.bed.pts) || s.bed.pts.length < 2 || !Array.isArray(s.shapes)) return false;
+  const num = (v) => typeof v === 'number' && isFinite(v);
+  if (!num(s.domain.L) || !num(s.domain.H) || s.domain.L <= 0 || s.domain.H <= 0) return false;
+  for (const p of s.bed.pts) if (!Array.isArray(p) || !num(p[0]) || !num(p[1])) return false;
+  for (const sh of s.shapes) {
+    if (!sh || !['rect', 'ellipse', 'poly', 'stroke'].includes(sh.kind) || !Array.isArray(sh.pts) || !sh.pts.length) return false;
+    for (const p of sh.pts) if (!Array.isArray(p) || !num(p[0]) || !num(p[1])) return false;
+    if (![0, 1, 2, 3, 4].includes(sh.mat)) return false;
+  }
+  return true;
+}
+function applyScene(s) {
+  if (!validScene(s)) return false;
+  scene = { bed: { pts: s.bed.pts.map(p => [p[0], p[1]]), cls: s.bed.cls | 0 }, shapes: s.shapes.map(sh => Object.assign({}, sh, { props: Object.assign({}, sh.props || {}) })) };
+  nextId = scene.shapes.reduce((m, sh) => Math.max(m, (sh.id | 0) + 1), 1);
+  for (const sh of scene.shapes) if (!sh.id) sh.id = nextId++;
+  selected = null; undoStack = [];
+  if (model && model.setScale) model.setScale(s.domain.scale === 'field' ? 'field' : 'lab');
+  if (s.model && model && model.setState) model.setState(s.model);
+  setDomain({ scale: s.domain.scale === 'field' ? 'field' : 'lab', L: s.domain.L, H: s.domain.H, res: RES_FACTOR[s.domain.res] ? s.domain.res : 'normal' }, false);
+  document.getElementById('bed-cls').value = String(scene.bed.cls);
+  updatePanel(); return true;
+}
+function openSceneText(text) { let s; try { s = JSON.parse(text); } catch (e) { return false; } return applyScene(s); }
+function saveLocal() { try { localStorage.setItem(STORE_KEY, JSON.stringify(captureScene())); } catch (e) { /* storage may be off */ } }
+function loadLocal() {
+  let s = null; try { s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) { s = null; }
+  if (s && !validScene(s)) { try { localStorage.removeItem(STORE_KEY); } catch (e) {} return null; }
+  return s;
+}
+function download(name, text) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+// ───────── sidebar ─────────
+function syncDomainInputs() {
+  const $ = (id) => document.getElementById(id);
+  $('scale').value = DOMAIN.scale; $('len').value = String(+DOMAIN.L.toFixed(3)); $('hgt').value = String(+DOMAIN.H.toFixed(3)); $('res').value = DOMAIN.res;
+}
+function updatePanel() {
+  const sel = shapeById(selected), mat = sel ? sel.mat : curMat, props = sel ? sel.props : curProps[curMat];
+  const $ = (id) => document.getElementById(id);
+  $('mat').value = String(mat === MAT.FLUID ? 0 : mat);
+  const info = MAT_INFO[mat]; let html = '';
+  if (info) for (const pr of info.props) {
+    if (pr[0] === 'cls') html += `<div class="row"><label for="mp-cls">${pr[1]}</label><select id="mp-cls" data-k="cls">${GRAIN.map((g, j) => `<option value="${j}"${(props.cls | 0) === j ? ' selected' : ''}>${g.label}</option>`).join('')}</select></div>`;
+    else html += `<div class="row"><label for="mp-${pr[0]}">${pr[1]}</label><input id="mp-${pr[0]}" data-k="${pr[0]}" type="number" min="${pr[2]}" max="${pr[3]}" step="${pr[4]}" value="${props[pr[0]]}"></div>`;
+  }
+  $('mat-props').innerHTML = html;
+  for (const el of $('mat-props').querySelectorAll('[data-k]')) el.addEventListener('change', onPropChange);
+  $('sel-note').textContent = sel ? 'Editing the selected ' + (sel.mat === MAT.FLUID ? 'eraser' : MAT_INFO[sel.mat].label) + ' shape.' : (tool === 'select' ? 'Click a shape to select it.' : '');
+  $('hint').textContent = HINTS[tool] || '';
+  for (const b of document.querySelectorAll('#toolbar button')) b.classList.toggle('on', b.dataset.tool === tool);
+}
+function onPropChange(e) {
+  const k = e.target.dataset.k, info = MAT_INFO[(shapeById(selected) || { mat: curMat }).mat];
+  const pr = info && info.props.find(p => p[0] === k); if (!pr) return;
+  let v = parseFloat(e.target.value); if (!isFinite(v)) { updatePanel(); return; }
+  v = Math.max(pr[2], Math.min(pr[3], v)); if (k === 'cls') v = v | 0;
+  const sel = shapeById(selected);
+  if (sel) { pushUndo(); sel.props[k] = v; sceneChanged(); } else { curProps[curMat][k] = v; }
+}
+const HINTS = {
+  select: 'Click a shape to select it. Drag to move, drag a handle to resize.',
+  brush: 'Drag to paint with the chosen material.',
+  line: 'Drag from one end to the other.',
+  poly: 'Click to add corners. Click the first corner, double-click or press Enter to close.',
+  rect: 'Drag a rectangle.', ellipse: 'Drag an ellipse.',
+  erase: 'Drag to carve back to water. It cuts the bed too.',
+  bed: 'Drag a point to reshape the bed. Click the line to add a point, right-click a point to remove it.',
+};
+function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
+
+function setRunning(v) { running = !!v; document.getElementById('run').textContent = running ? 'pause' : 'run'; }
+function restart() { if (model && model.reset) model.reset(); }
+let statsAt = 0;
+function updateStats(now) {
+  if (now - statsAt < 250) return; statsAt = now;
+  const rows = (model && model.readouts ? model.readouts() : []).concat([['shapes', String(scene.shapes.length)]]);
+  document.getElementById('stats').innerHTML = rows.map(([a, b]) => `<div class="row"><span>${a}</span><span>${b}</span></div>`).join('');
+}
+
+// ───────── loop ─────────
+function frame(now) {
+  const dt = lastFrame ? (now - lastFrame) / 1000 : 0; lastFrame = now;
+  if (model) model.frame(dt, running);
+  drawBackground();
+  if (model) model.render(view);
+  drawUI(now);
+  for (const b of backends) if (b.frame) b.frame();
+  updateStats(now);
+  requestAnimationFrame(frame);
+}
+
+function onKey(e) {
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  const k = e.key;
+  if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')) { e.preventDefault(); undo(); return; }
+  if (k === ' ') { e.preventDefault(); setRunning(!running); return; }
+  if (k === 'r' || k === 'R') { restart(); return; }
+  if (k >= '1' && k <= '8') { setTool(['select', 'brush', 'line', 'poly', 'rect', 'ellipse', 'erase', 'bed'][+k - 1]); return; }
+  if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
+  if (k === 'Escape') { polyPts = null; drag = null; selected = null; updatePanel(); return; }
+  if (k === 'Enter') { finishPoly(); return; }
+  if (k === '[') { reorderSelected(-1); return; } if (k === ']') { reorderSelected(1); return; }
+  if (k === '0') { fitView(); return; }
+  const pan = 60;
+  if (k === 'ArrowLeft') { view.x0 -= pan / view.s; viewFitted = false; return; }
+  if (k === 'ArrowRight') { view.x0 += pan / view.s; viewFitted = false; return; }
+  if (k === 'ArrowUp') { view.z0 += pan / (view.s * view.ve); viewFitted = false; return; }
+  if (k === 'ArrowDown') { view.z0 -= pan / (view.s * view.ve); viewFitted = false; return; }
+  const lk = k.toLowerCase();
+  if (model && model.keys && model.keys[lk]) { model.keys[lk](); return; }
+  for (const b of backends) if (b.keys && b.keys[lk]) { b.keys[lk](); return; }
+}
+
+function wire() {
+  const $ = (id) => document.getElementById(id);
+  cvBg = $('bg'); cvGpu = $('gpu'); cvUi = $('ui');
+  bgCtx = cvBg.getContext('2d'); uiCtx = cvUi.getContext('2d');
+  cvUi.addEventListener('pointerdown', (e) => { try { cvUi.setPointerCapture(e.pointerId); } catch (x) {} onDown(e); });
+  cvUi.addEventListener('pointermove', onMove);
+  cvUi.addEventListener('pointerup', onUp);
+  cvUi.addEventListener('pointercancel', () => { drag = null; });
+  cvUi.addEventListener('pointerleave', () => { hover = null; });
+  cvUi.addEventListener('dblclick', () => { if (tool === 'poly') { if (polyPts) polyPts.pop(); finishPoly(); } });
+  cvUi.addEventListener('contextmenu', (e) => e.preventDefault());
+  cvUi.addEventListener('wheel', (e) => { e.preventDefault(); const f = Math.exp(-e.deltaY * 0.0015); if (e.altKey) setVE(e.offsetX, e.offsetY, f); else zoomAt(e.offsetX, e.offsetY, f); }, { passive: false });
+  window.addEventListener('keydown', onKey);
+  window.addEventListener('resize', resize);
+  for (const b of document.querySelectorAll('#toolbar button')) b.addEventListener('click', () => setTool(b.dataset.tool));
+  $('mat').innerHTML = [1, 2, 3, 4].map(m => `<option value="${m}">${MAT_INFO[m].label}</option>`).join('');
+  $('mat').addEventListener('change', (e) => {
+    const m = +e.target.value, sel = shapeById(selected);
+    if (sel) { pushUndo(); sel.mat = m; sel.props = Object.assign({}, curProps[m] || {}); sceneChanged(); } else { curMat = m; updatePanel(); }
+  });
+  $('bed-cls').innerHTML = GRAIN.map((g, j) => `<option value="${j}">${g.label}</option>`).join('');
+  $('bed-cls').addEventListener('change', (e) => { pushUndo(); scene.bed.cls = +e.target.value; sceneChanged(); });
+  $('bed-flat').addEventListener('click', bedFlat);
+  $('bed-smooth').addEventListener('click', bedSmooth);
+  $('bed-apply-slope').addEventListener('click', () => { const v = parseFloat($('bed-slope').value); if (isFinite(v)) bedSlope(v); });
+  $('scale').addEventListener('change', (e) => setScale(e.target.value));
+  $('len').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ L: v }); else syncDomainInputs(); });
+  $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
+  $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
+  $('run').addEventListener('click', () => setRunning(!running));
+  $('restart').addEventListener('click', restart);
+  $('speed').addEventListener('change', (e) => { if (model && model.p) model.p.speed = +e.target.value; });
+  $('undo').addEventListener('click', undo);
+  $('save').addEventListener('click', () => download('scene.json', sceneFileText()));
+  $('open').addEventListener('click', () => $('open-file').click());
+  $('open-file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    f.text().then((t) => { if (!openSceneText(t)) alert('That file is not a flume scene.'); e.target.value = ''; });
+  });
+  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); });
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MODEL EXTENSION POINT
+// model.js registers one model. The interface hands it the grid and the material raster
+// and asks it to move and draw the water:
+//
+//   registerModel({
+//     id: 'flume',                         // required
+//     async init(api) -> { ok, reason },   // api: { canvas (the #gpu canvas), changed() };
+//                                          // a model that cannot run says why (shown in a banner)
+//     domain(scale) -> { L, H, dx },       // optional: default size and cell size per scale
+//     setScale(scale),                     // optional: 'lab' | 'field'
+//     setGrid(grid, raster),               // required: a new grid { nx, nz, dx } (re)allocates
+//     setRaster(raster),                   // required: the materials changed on the same grid
+//     reset(),                             // required: back to the starting water
+//     frame(dtWall, running),              // required: once per animation frame
+//     render(view),                        // required: draw the water into the #gpu canvas
+//     readouts() -> [[label, value], ...], // optional
+//     state() / setState(obj),             // optional: saved with the scene
+//     controls: { html, wire() },          // optional: mounted into #model-controls
+//     keys: { k: fn },                     // optional
+//   });
+//
+// The raster: nx x nz cells, index i + nx * k (k = 0 at the floor), cell size dx metres.
+//   mat[c]: 0 water/air, 1 solid, 2 porous, 3 canopy, 4 sediment
+//   porous:   p1 = porosity, p2 = stone size (m)
+//   canopy:   p1 = frontal area per volume (1/m), p2 = drag coefficient, p3 = stem diameter (m)
+//   sediment: cls = grain class (index into GRAIN)
+// The view: { x0, z0, s (CSS px per metre), ve (vertical exaggeration), cw, ch (CSS px), dpr };
+// a world point (x, z) is at ((x - x0) * s, ch - (z - z0) * s * ve) in CSS px.
+// ═════════════════════════════════════════════════════════════════════════════
+let model = null;
+function registerModel(m) {
+  if (model) throw new Error('registerModel: a model is already registered (' + model.id + ')');
+  for (const k of ['id', 'init', 'setGrid', 'setRaster', 'reset', 'frame', 'render']) if (!m || !m[k]) throw new Error('registerModel: a model needs ' + k);
+  model = m;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SITE EXTENSION POINT
+// site.js registers backends: { id, title?, mount(slot)?, frame()?, keys?, help? }.
+// captureScene() is the one description of the scene; sceneFileText() is it as a file.
+// ═════════════════════════════════════════════════════════════════════════════
+const backends = [];
+function registerBackend(b) {
+  if (!b || !b.id) throw new Error('registerBackend: a backend needs an id');
+  if (backends.some(x => x.id === b.id)) throw new Error('registerBackend: duplicate id ' + b.id);
+  backends.push(b);
+}
+
+// a short message in the banner that fades (the model uses it to say the GPU was reset)
+let noteTimer = null;
+function showNote(text) {
+  const bn = document.getElementById('banner'); bn.textContent = text; bn.hidden = false;
+  clearTimeout(noteTimer); noteTimer = setTimeout(() => { bn.hidden = true; }, 6000);
+}
+
+// ───────── boot ─────────
+let booted = false;
+async function boot() {
+  wire();
+  const saved = loadLocal();
+  if (model && model.controls) {
+    if (model.controls.html) document.getElementById('model-controls').innerHTML = model.controls.html;
+  }
+  const readback = /[?&]readback\b/.test((typeof location !== 'undefined' && location.search) || '');
+  const res = model ? await model.init({ canvas: cvGpu, changed: saveLocal, notify: showNote, readback }) : { ok: false, reason: 'No model is loaded.' };
+  if (!res.ok) { const bn = document.getElementById('banner'); bn.textContent = res.reason || 'The model could not start.'; bn.hidden = false; }
+  if (model && model.controls && model.controls.wire) model.controls.wire();
+  resize();
+  GRID = gridFor(DOMAIN);
+  if (!(saved && applyScene(saved))) { scene.bed = defaultBed(DOMAIN); setDomain({}, false); }
+  if (model && model.p) document.getElementById('speed').value = String(model.p.speed || 1);
+  for (const b of backends) {
+    if (b.title) document.title = b.title;
+    if (b.mount) b.mount(document.getElementById('site-slot'));
+    if (b.help) document.getElementById('help-site').innerHTML += ' &middot; ' + b.help;
+  }
+  setTool('select');
+  booted = true;
+  requestAnimationFrame(frame);
+}
+window.addEventListener('load', () => { boot().catch((e) => { console.error(e); const bn = document.getElementById('banner'); bn.textContent = 'Start-up failed: ' + e.message; bn.hidden = false; }); });
+</script>
+<script src="model.js"></script>
+<script src="site.js"></script>
+</body>
+</html>
