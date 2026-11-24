@@ -20,6 +20,8 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
   console.log('flume model checks');
 
   const res = await M.init({ gpu });
+  if (process.env.FLUME_ADVECTION) M.advection = process.env.FLUME_ADVECTION;
+  console.log('momentum advection: ' + (M.advection === 'sl' ? 'semi-Lagrangian' : 'conservative finite volume'));
   check('init finds a GPU', res.ok, res.reason);
   if (!res.ok) process.exit(1);
 
@@ -47,10 +49,13 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
   async function volume(r) { const f = await M.debug.read('f'); let s = 0; for (let c = 0; c < r.nx * r.nz; c++) s += f[c]; return s * r.dx * r.dx; }
   const stepFor = (dx, v) => 0.4 * dx / v;
 
-  // 1. still water, flat bed of sediment, a submerged solid block and a porous patch
+  const ONLY = (process.env.FLUME_ONLY || '').split(',').filter(Boolean);
+  const want = (name) => !ONLY.length || ONLY.includes(name);
   const dx = 0.02;
+  // 1. still water, flat bed of sediment, a submerged solid block and a porous patch
+  if (want('still')) {
   let r = flume(10, 1.0, dx, (x, z) => (z < 0.1 ? 4 : (x > 4 && x < 5 && z < 0.3) ? 1 : (x > 6 && x < 7 && z < 0.35) ? 2 : 0));
-  let err = await setup(r, { type: 'river', h0: 0.5, q: 0, hout: 0.5 });
+  var err = await setup(r, { type: 'river', h0: 0.5, q: 0, hout: 0.5 });
   check('every pipeline builds and binds without a validation error', !err, err);
   const rerr = await M.debug.validateRender(400, 200);
   check('the water renderer builds and draws', !rerr, rerr);
@@ -69,7 +74,10 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
   const f2 = await M.debug.read('f'); let wet2 = 0; for (let c = 0; c < r2.nx * r2.nz; c++) if (r2.mat[c] === 1 && f2[c] > 0) wet2++;
   check('drawing a wall into the water empties its cells', wet2 === 0, wet2 + ' cells');
 
+  }
+
   // 3. waves: lab flume 20 m, h = 0.4 m, H = 0.06 m, T = 1.6 s
+  if (want('waves')) {
   const rw = flume(20, 0.8, dx, () => 0);
   err = await setup(rw, { type: 'wave', h0: 0.4, H: 0.06, T: 1.6 });
   const wt = M.debug.pistonStroke(0.06, 1.6, 0.4);
@@ -90,7 +98,10 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     'H at 1, 1.5, 2 wavelengths: ' + Hs.map(h => (h * 100).toFixed(1)).join(', ') + ' cm; asked 6.0 cm; wavelength ' + wt.L.toFixed(2) + ' m');
   check('the sponge takes the waves out at the far end (under a fifth of the height)', (hiE - loE) < Hmean / 5, ((hiE - loE) * 100).toFixed(1) + ' cm');
 
+  }
+
   // 4. river: q = 0.06 m2/s over a flat bed, h = 0.3 m: mean velocity 0.2 m/s mid-flume
+  if (want('river')) {
   const rr = flume(10, 0.8, dx, (x, z) => (z < 0.04 ? 4 : 0));
   err = await setup(rr, { type: 'river', h0: 0.34, q: 0.06, hout: 0.30 });   // water level 0.34 over a 0.04 bed: depth 0.30
   const dtr = stepFor(dx, 0.6);
@@ -106,6 +117,88 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
   const vB = await volume(rr), qm = qsum / nq;
   check('the river carries its discharge through the middle (10 s mean, within 3%)', Math.abs(qm - 0.06) / 0.06 < 0.03, 'q = ' + qm.toFixed(4) + ' m²/s per m, asked 0.06');
   check('the river holds its volume over 10 s (within 0.5%)', Math.abs(vB - vA) / vA < 0.005, (100 * (vB - vA) / vA).toFixed(2) + '%');
+
+  }
+
+  // ── stage 2: hydraulics against textbook results ──
+  const g = 9.81, d1 = 0.01;
+  // mean of the surface height at x over the last `secs` seconds
+  async function meanEta(xs, secs, dt) {
+    const sums = xs.map(() => 0); let n = 0;
+    for (let t = 0; t < secs; t += 0.25) {
+      await M.debug.steps(Math.round(0.25 / dt), dt);
+      const eta = await M.debug.read('eta'); xs.forEach((x, j) => { sums[j] += eta[Math.round(x / M.grid.dx)]; }); n++;
+    }
+    return sums.map(v => v / n);
+  }
+  const bedOf = (zb) => (x, z) => (z < zb ? 4 : 0);
+
+  // 5. broad-crested weir, free overflow: specific energy over the crest E = 1.5 h_c (ideal).
+  //    A sharp-cornered broad-crested weir (head about 0.1 to 0.3 of the crest length) has a
+  //    discharge coefficient near 0.85, so E / 1.5 h_c near (1/0.85)^(2/3) = 1.11.
+  if (want('weir')) {
+    const zb = 0.02, P = 0.20, q = 0.03, hc = Math.cbrt(q * q / g);
+    const rr = flume(8, 0.6, d1, (x, z) => (z < zb ? 4 : (x > 3 && x < 3.4 && z < zb + P) ? 1 : 0));
+    await setup(rr, { type: 'river', h0: zb + P + 1.6 * hc, q, hout: 0.05 });
+    const dt = stepFor(d1, 1.2); await M.debug.steps(Math.round(35 / dt), dt);
+    const [eUp] = await meanEta([2.0], 5, dt);
+    const H1 = eUp - zb - P, v = q / (eUp - zb), E = H1 + v * v / (2 * g), ratio = E / (1.5 * hc);
+    check('broad-crested weir: energy over the crest 1.03 to 1.20 times 1.5 h_c (discharge coefficient 0.76 to 0.96)', isFinite(ratio) && ratio > 1.03 && ratio < 1.20,
+      'E = ' + (E * 1000).toFixed(1) + ' mm, 1.5 h_c = ' + (1.5 * hc * 1000).toFixed(1) + ' mm, ratio ' + ratio.toFixed(3));
+  }
+
+  // 6. hydraulic jump below a sluice gate: the depth after the jump matches Belanger's conjugate
+  //    depth for the measured depth before it
+  if (want('jump')) {
+    const zb = 0.02, h1 = 0.04, q = 0.10;
+    const Fr = q / (h1 * Math.sqrt(g * h1)), h2 = h1 / 2 * (Math.sqrt(1 + 8 * Fr * Fr) - 1);
+    const rr = flume(8, 0.5, d1, (x, z) => (z < zb ? 4 : (x < 0.1 && z > zb + h1) ? 1 : 0));
+    await setup(rr, { type: 'river', h0: zb + h1, q, hout: 0.85 * h2 });   // a little under the ideal conjugate, so friction does not drown the jump against the gate
+    const dt = stepFor(d1, 3.5); await M.debug.steps(Math.round(30 / dt), dt);
+    // time-mean depth profile over 4 s
+    const xs = []; for (let x = 0.2; x < 7.8; x += 0.05) xs.push(x);
+    const eta = await meanEta(xs, 4, dt), dep = eta.map(e => e - zb);
+    const toe = xs.find((x, j) => dep[j] > (h1 + h2) / 2);
+    const jt = xs.indexOf(toe);
+    // before: the shallowest depth in the metre upstream of the toe; after: mean depth 1 to 2 m past it
+    const seg = (a, b) => dep.slice(Math.max(0, jt + Math.round(a / 0.05)), Math.min(dep.length, jt + Math.round(b / 0.05)));
+    const before = toe ? Math.min(...seg(-1.0, 0)) : 1, aft = toe ? seg(1.0, 2.0) : [0], after = aft.reduce((x, y) => x + y, 0) / aft.length;
+    const FrB = q / (before * Math.sqrt(g * before)), h2B = before / 2 * (Math.sqrt(1 + 8 * FrB * FrB) - 1);
+    check('hydraulic jump forms and stays in the flume', toe !== undefined && toe > 0.3 && toe < 6.5, 'toe at ' + (toe ? toe.toFixed(2) : 'none') + ' m');
+    check('hydraulic jump: depth after the jump within 12% of the conjugate of the depth before it', toe !== undefined && Math.abs(after - h2B) / h2B < 0.12,
+      'before ' + (before * 1000).toFixed(0) + ' mm (Fr ' + FrB.toFixed(2) + '), after ' + (after * 1000).toFixed(0) + ' mm, Belanger ' + (h2B * 1000).toFixed(0) + ' mm');
+  }
+
+  // 7. porous block across the whole flume: head drop = integral of (A u + B u^2)/g, superficial u
+  if (want('porous')) {
+    const zb = 0.02, q = 0.005, n = 0.4, dd = 0.02;
+    const rr = flume(8, 0.5, d1, (x, z) => (z < zb ? 4 : (x > 3 && x < 4) ? 2 : 0));
+    for (let c = 0; c < rr.mat.length; c++) if (rr.mat[c] === 2) { rr.p1[c] = n; rr.p2[c] = dd; }
+    await setup(rr, { type: 'river', h0: zb + 0.30, q, hout: 0.28 });
+    const dt = stepFor(d1, 0.3); await M.debug.steps(Math.round(40 / dt), dt);
+    const [eu, ed] = await meanEta([2.5, 4.5], 5, dt);
+    const hu = eu - zb, hd = ed - zb, dH = (eu - ed) + (q * q / (hu * hu) - q * q / (hd * hd)) / (2 * g);
+    const A = 1000 * (1 - n) ** 2 / n ** 3 * 1e-6 / (dd * dd), B = 1.1 * (1 - n) / n ** 3 / dd;
+    let th = 0; const nseg = 20; for (let j = 0; j < nseg; j++) { const h = hu + (hd - hu) * (j + 0.5) / nseg, u = q / h; th += (A * u + B * u * u) / g * (1 / nseg); }
+    check('porous block: head drop within 15% of Darcy-Forchheimer', th > 0 && isFinite(dH) && Math.abs(dH - th) / th < 0.15, 'drop ' + (dH * 1000).toFixed(1) + ' mm, theory ' + (th * 1000).toFixed(1) + ' mm');
+  }
+
+  // 8. plant patch across the whole flume: head drop = integral of 1/2 Cd a u^2 / g over its length
+  if (want('plants')) {
+    const zb = 0.02, q = 0.03, a = 20, cd = 1.0, Lp = 2;
+    const rr = flume(8, 0.5, d1, (x, z) => (z < zb ? 4 : (x > 3 && x < 3 + Lp) ? 3 : 0));
+    for (let c = 0; c < rr.mat.length; c++) if (rr.mat[c] === 3) { rr.p1[c] = a; rr.p2[c] = cd; rr.p3[c] = 0.006; }
+    await setup(rr, { type: 'river', h0: zb + 0.30, q, hout: 0.28 });
+    const dt = stepFor(d1, 0.5); await M.debug.steps(Math.round(40 / dt), dt);
+    const [eu, ed] = await meanEta([2.5, 3 + Lp + 0.5], 5, dt);
+    const hu = eu - zb, hd = ed - zb, dH = (eu - ed) + (q * q / (hu * hu) - q * q / (hd * hd)) / (2 * g);
+    let th = 0; const nseg = 20; for (let j = 0; j < nseg; j++) { const h = hu + (hd - hu) * (j + 0.5) / nseg, u = q / h; th += 0.5 * cd * a * u * u / g * (Lp / nseg); }
+    check('plant patch: head drop within 20% of 1/2 Cd a u^2', th > 0 && isFinite(dH) && Math.abs(dH - th) / th < 0.2, 'drop ' + (dH * 1000).toFixed(1) + ' mm, theory ' + (th * 1000).toFixed(1) + ' mm');
+    // bed friction shapes the velocity profile upstream (about 10 cm/s): slower next to the bed
+    const u = await M.debug.read('u'), i = Math.round(2.0 / d1), kb = Math.round(zb / d1), kt = Math.round((zb + hu) / d1) - 3;
+    const ub = u[i + (rr.nx + 1) * kb], us = u[i + (rr.nx + 1) * kt];
+    check('bed friction: velocity next to the bed is below the velocity near the surface', us > 0.01 && ub > 0 && ub < 0.95 * us, 'bed ' + (ub * 100).toFixed(2) + ' cm/s, near surface ' + (us * 100).toFixed(2) + ' cm/s');
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

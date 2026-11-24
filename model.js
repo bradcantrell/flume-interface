@@ -7,20 +7,28 @@
 //   projection, conservative directional-split PLIC volume of fluid (Weymouth-Yue).
 //
 // The interface hands the model a material raster (see MODEL EXTENSION POINT in index.html).
-// Stage 1: solid and sediment cells are walls; porous and canopy cells are open water
-// (their drag comes in stage 2). Everything here runs in a browser or in Node (Dawn).
+// Solid and sediment cells are walls (sediment moves in stage 4). Porous and plant cells are
+// water with drag: Darcy-Forchheimer for porous (van Gent coefficients, superficial velocity,
+// as OpenFOAM's porosityForce), 1/2 Cd a |u| u on horizontal flow for plants. Turbulence is a
+// Smagorinsky eddy viscosity; walls and the bed have log-law friction with ks = 2.5 d50.
+// Porous cells keep full volume for water (no porosity in storage), as in the OpenFOAM export.
+// Everything here runs in a browser or in Node (Dawn).
 (function () {
   'use strict';
 
   const G = 9.81;
   const K_CG = 8;            // CG iterations per step (8 reaches the single-precision floor, see spike)
   const CFL = 0.4;
+  const NU_WATER = 1e-6;     // m2/s
+  const CS_SMAG = 0.17;      // Smagorinsky constant
+  const POROUS_ALPHA = 1000, POROUS_BETA = 1.1;     // van Gent (1995) coefficients
+  const GRAIN_D = [0.0002, 0.001, 0.01];            // m: fine sand, coarse sand, gravel (as the interface's GRAIN)
 
   // ───────────────────────── WGSL ─────────────────────────
   const HEAD = `
 struct P { nx:u32, nz:u32, cnx:u32, cnz:u32, dx:f32, dt:f32, g:f32, mode:f32,
            uin:f32, hin:f32, uout:f32, hout:f32, S:f32, om:f32, sx0:f32, srate:f32,
-           zin:f32, zout:f32, q:f32, pad:f32 };
+           zin:f32, zout:f32, q:f32, nu:f32, cs:f32, pad1:f32, pad2:f32, pad3:f32 };
 @group(0) @binding(0) var<uniform> prm: P;
 `;
   const PLIC = `
@@ -96,16 +104,25 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
   // Level 0 of the pressure operator places the free surface where it is (ghost fluid): an air
   // neighbour adds 1/theta to the diagonal, theta = fraction of a cell from this centre to the
   // surface (from the volume fractions; clamped at 0.1). Coarse levels keep theta = 1.
+  // The level-0 pressure operator carries two corrections:
+  //  - ghost fluid: an air neighbour adds 1/theta, theta = fraction of a cell from this centre to
+  //    the surface (from the volume fractions, clamped at 0.1), so the surface sits where it is;
+  //  - drag inside the solve: each face has beta = 1/(1 + dt K) (K = drag + wall friction), and the
+  //    projection is u = beta (u* - dt grad p), so steady flow feels the full drag at any dt.
+  // Coarse multigrid levels keep theta = beta = 1 (they only precondition).
   const NBG = `
 fn theta(c:u32, n:u32) -> f32 { return clamp(F[c] + F[n] - 0.5, 0.1, 1.0); }
 fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
-  var d = 0.0; var s = 0.0; let N = prm.nx;
-  if (i > 0u)        { let t = typ[c-1u]; if (t == 1u) { d += 1.0; s += X[c-1u]; } else if (t == 2u) { d += 1.0/theta(c, c-1u); } }
-  if (i < prm.nx-1u) { let t = typ[c+1u]; if (t == 1u) { d += 1.0; s += X[c+1u]; } else if (t == 2u) { d += 1.0/theta(c, c+1u); } }
-  if (k > 0u)        { let t = typ[c-N];  if (t == 1u) { d += 1.0; s += X[c-N]; }  else if (t == 2u) { d += 1.0/theta(c, c-N); } }
-  if (k < prm.nz-1u) { let t = typ[c+N];  if (t == 1u) { d += 1.0; s += X[c+N]; }  else if (t == 2u) { d += 1.0/theta(c, c+N); } }
+  var d = 0.0; var s = 0.0; let N = prm.nx; let W = prm.nx + 1u;
+  if (i > 0u)        { let t = typ[c-1u]; let b = BU[i+W*k];      if (t == 1u) { d += b; s += b*X[c-1u]; } else if (t == 2u) { d += b/theta(c, c-1u); } }
+  if (i < prm.nx-1u) { let t = typ[c+1u]; let b = BU[i+1u+W*k];   if (t == 1u) { d += b; s += b*X[c+1u]; } else if (t == 2u) { d += b/theta(c, c+1u); } }
+  if (k > 0u)        { let t = typ[c-N];  let b = BW[i+N*k];      if (t == 1u) { d += b; s += b*X[c-N]; }  else if (t == 2u) { d += b/theta(c, c-N); } }
+  if (k < prm.nz-1u) { let t = typ[c+N];  let b = BW[i+N*(k+1u)]; if (t == 1u) { d += b; s += b*X[c+N]; }  else if (t == 2u) { d += b/theta(c, c+N); } }
   *x = s; return d;
 }
+`;
+  const AIR = `fn isAir(i:i32, k:i32) -> bool { if (i < 0 || k < 0 || i >= i32(prm.nx) || k >= i32(prm.nz)) { return false; } return typ[u32(i) + prm.nx*u32(k)] == 2u; }\n`;
+  const MM = `fn mm(a:f32, b:f32) -> f32 { if (a*b <= 0.0) { return 0.0; } return select(b, a, abs(a) < abs(b)); }
 `;
   function K(binds, body, extra = '', wg = 64) {
     let decl = '';
@@ -149,7 +166,74 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
       let x = (f32(i)+0.5)*prm.dx; let z = f32(k)*prm.dx; let dt = prm.dt;
       let ww = w[c]; let uu = 0.25*(u[i+W*(k-1u)] + u[i+1u+W*(k-1u)] + u[i+W*k] + u[i+1u+W*k]);
       let xm = x - 0.5*dt*uu; let zm = z - 0.5*dt*ww;
-      o[c] = sW(x - dt*sU(xm, zm), z - dt*sW(xm, zm)) - prm.g*dt;`, SAMPLE),
+      o[c] = sW(x - dt*sU(xm, zm), z - dt*sW(xm, zm));`, SAMPLE),
+    // Conservative momentum advection (finite volume on the staggered grid): fluxes through each
+    // velocity cell's faces, second-order upwind with a minmod limiter, forward Euler (TVD at
+    // CFL <= 0.5). It conserves momentum, which is what sets the depths across a hydraulic jump.
+    advFU: K([['u', 'f'], ['w', 'f'], ['o', 'f'], ['typ', 'u']], `let W = prm.nx+1u; let N = prm.nx; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
+      if (i == 0u || i == prm.nx) { o[c] = u[c]; return; }
+      // fall back to semi-Lagrangian next to the free surface (any air cell in the stencil) and
+      // wherever the local Courant number is above 0.45 (the flux form is only stable below 0.5)
+      var nearAir = false;
+      for (var dk = -1; dk <= 1; dk++) { for (var di = -2; di <= 1; di++) { if (isAir(i32(i) + di, i32(k) + dk)) { nearAir = true; } } }
+      let cmax = max(max(abs(u[c-1u]), abs(u[c])), max(abs(u[c+1u]), max(abs(w[i-1u+N*k]), abs(w[i+N*(k+1u)])))) * prm.dt / prm.dx;
+      if (nearAir || cmax > 0.45) {
+        let x = f32(i)*prm.dx; let z = (f32(k)+0.5)*prm.dx; let dt = prm.dt;
+        let ww = 0.25*(w[i-1u+N*k] + w[i+N*k] + w[i-1u+N*(k+1u)] + w[i+N*(k+1u)]);
+        let xm = x - 0.5*dt*u[c]; let zm = z - 0.5*dt*ww;
+        o[c] = sU(x - dt*sU(xm, zm), z - dt*sW(xm, zm)); return;
+      }
+      let uc = u[c];
+      // east and west faces of the u-cell are cell centres i and i-1
+      let ue = 0.5*(uc + u[c+1u]); let uw = 0.5*(u[c-1u] + uc);
+      var qe: f32; if (ue > 0.0) { var d2 = 0.0; d2 = u[c+1u] - uc; qe = uc + 0.5*mm(uc - u[c-1u], d2); }
+                   else { var d3 = 0.0; if (i + 2u <= prm.nx) { d3 = u[c+2u] - u[c+1u]; } qe = u[c+1u] - 0.5*mm(u[c+1u] - uc, d3); }
+      var qw: f32; if (uw > 0.0) { var d1 = 0.0; if (i >= 2u) { d1 = u[c-1u] - u[c-2u]; } qw = u[c-1u] + 0.5*mm(d1, uc - u[c-1u]); }
+                   else { qw = uc - 0.5*mm(uc - u[c-1u], u[c+1u] - uc); }
+      // north and south faces are corners: w averaged over the two cells either side
+      var fluxN = 0.0; var fluxS = 0.0;
+      if (k + 1u < prm.nz) {
+        let vn = 0.5*(w[i-1u+N*(k+1u)] + w[i+N*(k+1u)]);
+        var q: f32; if (vn > 0.0) { var dm = 0.0; if (k > 0u) { dm = uc - u[c-W]; } q = uc + 0.5*mm(dm, u[c+W] - uc); }
+                    else { var dp = 0.0; if (k + 2u < prm.nz) { dp = u[c+2u*W] - u[c+W]; } q = u[c+W] - 0.5*mm(u[c+W] - uc, dp); }
+        fluxN = vn*q; }
+      if (k > 0u) {
+        let vs = 0.5*(w[i-1u+N*k] + w[i+N*k]);
+        var q: f32; if (vs > 0.0) { var dm = 0.0; if (k >= 2u) { dm = u[c-W] - u[c-2u*W]; } q = u[c-W] + 0.5*mm(dm, uc - u[c-W]); }
+                    else { var dp = 0.0; if (k + 1u < prm.nz) { dp = u[c+W] - uc; } q = uc - 0.5*mm(uc - u[c-W], dp); }
+        fluxS = vs*q; }
+      o[c] = uc - prm.dt/prm.dx*(ue*qe - uw*qw + fluxN - fluxS);`, MM + SAMPLE + AIR),
+    advFW: K([['u', 'f'], ['w', 'f'], ['o', 'f'], ['typ', 'u']], `let W = prm.nx+1u; let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      if (k == 0u || k == prm.nz) { o[c] = 0.0; return; }
+      var nearAir = false;
+      for (var dk = -2; dk <= 1; dk++) { for (var di = -1; di <= 1; di++) { if (isAir(i32(i) + di, i32(k) + dk)) { nearAir = true; } } }
+      let cmax = max(max(abs(w[c-N]), abs(w[c])), max(abs(w[c+N]), max(abs(u[i+W*k]), abs(u[i+1u+W*(k-1u)])))) * prm.dt / prm.dx;
+      if (nearAir || cmax > 0.45) {
+        let x = (f32(i)+0.5)*prm.dx; let z = f32(k)*prm.dx; let dt = prm.dt;
+        let uu = 0.25*(u[i+W*(k-1u)] + u[i+1u+W*(k-1u)] + u[i+W*k] + u[i+1u+W*k]);
+        let xm = x - 0.5*dt*uu; let zm = z - 0.5*dt*w[c];
+        o[c] = sW(x - dt*sU(xm, zm), z - dt*sW(xm, zm)); return;
+      }
+      let wc = w[c];
+      // north and south faces of the w-cell are cell centres k and k-1
+      let wn = 0.5*(wc + w[c+N]); let ws = 0.5*(w[c-N] + wc);
+      var qn: f32; if (wn > 0.0) { qn = wc + 0.5*mm(wc - w[c-N], w[c+N] - wc); }
+                   else { var d3 = 0.0; if (k + 2u <= prm.nz) { d3 = w[c+2u*N] - w[c+N]; } qn = w[c+N] - 0.5*mm(w[c+N] - wc, d3); }
+      var qs: f32; if (ws > 0.0) { var d1 = 0.0; if (k >= 2u) { d1 = w[c-N] - w[c-2u*N]; } qs = w[c-N] + 0.5*mm(d1, wc - w[c-N]); }
+                   else { qs = wc - 0.5*mm(wc - w[c-N], w[c+N] - wc); }
+      // east and west faces are corners: u averaged over the two cells above and below
+      var fluxE = 0.0; var fluxW = 0.0;
+      if (i + 1u < N) {
+        let ve = 0.5*(u[i+1u+W*(k-1u)] + u[i+1u+W*k]);
+        var q: f32; if (ve > 0.0) { var dm = 0.0; if (i > 0u) { dm = wc - w[c-1u]; } q = wc + 0.5*mm(dm, w[c+1u] - wc); }
+                    else { var dp = 0.0; if (i + 2u < N) { dp = w[c+2u] - w[c+1u]; } q = w[c+1u] - 0.5*mm(w[c+1u] - wc, dp); }
+        fluxE = ve*q; }
+      if (i > 0u) {
+        let vw = 0.5*(u[i+W*(k-1u)] + u[i+W*k]);
+        var q: f32; if (vw > 0.0) { var dm = 0.0; if (i >= 2u) { dm = w[c-1u] - w[c-2u]; } q = w[c-1u] + 0.5*mm(dm, wc - w[c-1u]); }
+                    else { var dp = 0.0; if (i + 1u < N) { dp = w[c+1u] - wc; } q = wc - 0.5*mm(wc - w[c-1u], dp); }
+        fluxW = vw*q; }
+      o[c] = wc - prm.dt/prm.dx*(wn*qn - ws*qs + fluxE - fluxW);`, MM + SAMPLE + AIR),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -178,19 +262,20 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
     spongeW: K([['w', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} if (prm.mode < 0.5) {return;}
       let x = (f32(c % N) + 0.5)*prm.dx; let L = f32(prm.nx)*prm.dx; if (x <= prm.sx0) {return;}
       let r = (x - prm.sx0)/max(L - prm.sx0, 1e-6); w[c] = w[c]/(1.0 + prm.srate*prm.dt*r*r);`),
-    rhs: K([['typ', 'u'], ['u', 'f'], ['w', 'f'], ['r', 'f'], ['p', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx; let W = prm.nx+1u;
+    rhs: K([['typ', 'u'], ['u', 'f'], ['w', 'f'], ['r', 'f'], ['p', 'f'], ['BU', 'f'], ['BW', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx; let W = prm.nx+1u; let N = prm.nx;
       p[c] = 0.0;
       if (typ[c] != 1u) { r[c] = 0.0; return; }
-      let div = (u[i+1u+W*k] - u[i+W*k] + w[i+prm.nx*(k+1u)] - w[i+prm.nx*k]) / prm.dx;
+      let a = i+W*k; let b = i+N*k;
+      let div = (BU[a+1u]*u[a+1u] - BU[a]*u[a] + BW[b+N]*w[b+N] - BW[b]*w[b]) / prm.dx;
       r[c] = -div*prm.dx*prm.dx/prm.dt;`),
     applyA: K([['typ', 'u'], ['X', 'f'], ['q', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
       if (typ[c] != 1u) { q[c] = 0.0; return; } var s = 0.0; let d = nbr(c, i, k, &s); q[c] = d*X[c] - s;`, NB),
-    applyA0: K([['typ', 'u'], ['X', 'f'], ['q', 'f'], ['F', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
+    applyA0: K([['typ', 'u'], ['X', 'f'], ['q', 'f'], ['F', 'f'], ['BU', 'f'], ['BW', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
       if (typ[c] != 1u) { q[c] = 0.0; return; } var s = 0.0; let d = nbr(c, i, k, &s); q[c] = d*X[c] - s;`, NBG),
-    rbgs0: K([['typ', 'u'], ['X', 'f'], ['b', 'f'], ['F', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
+    rbgs0: K([['typ', 'u'], ['X', 'f'], ['b', 'f'], ['F', 'f'], ['BU', 'f'], ['BW', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
       if (typ[c] != 1u || ((i + k) & 1u) != COLOR) { return; }
       var s = 0.0; let d = nbr(c, i, k, &s); if (d > 0.0) { X[c] = (b[c] + s)/d; }`, 'override COLOR: u32;\n' + NBG),
-    resid0: K([['typ', 'u'], ['X', 'f'], ['b', 'f'], ['r', 'f'], ['F', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
+    resid0: K([['typ', 'u'], ['X', 'f'], ['b', 'f'], ['r', 'f'], ['F', 'f'], ['BU', 'f'], ['BW', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
       if (typ[c] != 1u) { r[c] = 0.0; return; } var s = 0.0; let d = nbr(c, i, k, &s); r[c] = b[c] - (d*X[c] - s);`, NBG),
     rbgs: K([['typ', 'u'], ['X', 'f'], ['b', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx;
       if (typ[c] != 1u || ((i + k) & 1u) != COLOR) { return; }
@@ -230,16 +315,16 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
     beta: K([['scal', 'f']], `if (c == 0u) { scal[3] = select(0.0, scal[4]/scal[0], abs(scal[0]) > 1e-30); scal[0] = scal[4]; }`),
     updPR: K([['p', 'f'], ['r', 'f'], ['s', 'f'], ['q', 'f'], ['scal', 'f']], `if (c >= prm.nx*prm.nz) {return;} let a = scal[2]; p[c] += a*s[c]; r[c] -= a*q[c];`),
     updS: K([['s', 'f'], ['z', 'f'], ['scal', 'f']], `if (c >= prm.nx*prm.nz) {return;} s[c] = z[c] + scal[3]*s[c];`),
-    projU: K([['typ', 'u'], ['p', 'f'], ['u', 'f'], ['F', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
+    projU: K([['typ', 'u'], ['p', 'f'], ['u', 'f'], ['F', 'f'], ['BU', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
       if (i == 0u || i == prm.nx) { return; } let cl = i-1u+prm.nx*k; let cr = i+prm.nx*k; let l = typ[cl]; let r = typ[cr];
       if (l == 0u || r == 0u || (l != 1u && r != 1u)) { return; }
       var th = 1.0; if (l == 2u || r == 2u) { th = clamp(F[cl] + F[cr] - 0.5, 0.1, 1.0); }
-      u[c] -= prm.dt/prm.dx*(p[cr] - p[cl])/th;`),
-    projW: K([['typ', 'u'], ['p', 'f'], ['w', 'f'], ['F', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      u[c] = BU[c]*(u[c] - prm.dt/prm.dx*(p[cr] - p[cl])/th);`),
+    projW: K([['typ', 'u'], ['p', 'f'], ['w', 'f'], ['F', 'f'], ['BW', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
       if (k == 0u || k == prm.nz) { return; } let cb = i+N*(k-1u); let ct = i+N*k; let b = typ[cb]; let t = typ[ct];
       if (b == 0u || t == 0u || (b != 1u && t != 1u)) { return; }
       var th = 1.0; if (b == 2u || t == 2u) { th = clamp(F[cb] + F[ct] - 0.5, 0.1, 1.0); }
-      w[c] -= prm.dt/prm.dx*(p[ct] - p[cb])/th;`),
+      w[c] = BW[c]*(w[c] - prm.dt/prm.dx*(p[ct] - p[cb])/th);`),
     fluxX: K([['f', 'f'], ['u', 'f'], ['fl', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = i32(c % W); let k = i32(c / W);
       let vel = u[c]; if (vel == 0.0) { fl[c] = 0.0; return; } let s = abs(vel)*prm.dt/prm.dx;
       let di = select(i, i - 1, vel > 0.0);
@@ -267,6 +352,66 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
       var above = 0.0; if (u32(top) + 1u < prm.nz) { above = f[i + N*(u32(top) + 1u)]; }
       eta[i] = (f32(top) + f[i + N*u32(top)] + above)*prm.dx;`),
     tick: K([['tb', 'f']], `if (c == 0u) { tb[0] += prm.dt; }`),
+    // Smagorinsky eddy viscosity per wet cell, capped for explicit stability
+    nut: K([['u', 'f'], ['w', 'f'], ['typ', 'u'], ['nt', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx; let W = prm.nx+1u; let N = prm.nx;
+      if (typ[c] != 1u) { nt[c] = 0.0; return; }
+      let dx = prm.dx;
+      let dudx = (u[i+1u+W*k] - u[i+W*k])/dx; let dwdz = (w[i+N*(k+1u)] - w[i+N*k])/dx;
+      let kd = select(k, k - 1u, k > 0u); let ku = min(k + 1u, prm.nz - 1u);
+      let id = select(i, i - 1u, i > 0u); let iu = min(i + 1u, prm.nx - 1u);
+      let ucu = 0.5*(u[i+W*ku] + u[i+1u+W*ku]); let ucd = 0.5*(u[i+W*kd] + u[i+1u+W*kd]);
+      let wcr = 0.5*(w[iu+N*k] + w[iu+N*(k+1u)]); let wcl = 0.5*(w[id+N*k] + w[id+N*(k+1u)]);
+      let dudz = (ucu - ucd)/(f32(ku - kd)*dx + 1e-9); let dwdx = (wcr - wcl)/(f32(iu - id)*dx + 1e-9);
+      let S = sqrt(2.0*dudx*dudx + 2.0*dwdz*dwdz + (dudz + dwdx)*(dudz + dwdx));
+      nt[c] = min(prm.cs*prm.cs*dx*dx*S, 0.2*dx*dx/prm.dt);`),
+    // viscous + eddy diffusion of u (walls are handled by the wall-friction kernels, not here)
+    diffU: K([['u', 'f'], ['typ', 'u'], ['nt', 'f'], ['o', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W; let N = prm.nx;
+      if (i == 0u || i == prm.nx) { o[c] = u[c]; return; }
+      let l = typ[i-1u+N*k]; let r = typ[i+N*k];
+      if (l == 0u || r == 0u || (l != 1u && r != 1u)) { o[c] = u[c]; return; }
+      let nu = prm.nu + 0.5*(nt[i-1u+N*k] + nt[i+N*k]);
+      var lap = 0.0; let uc = u[c];
+      if (i > 1u && typ[i-2u+N*k] != 0u) { lap += u[c-1u] - uc; }
+      if (i < prm.nx-1u && typ[i+1u+N*k] != 0u) { lap += u[c+1u] - uc; }
+      if (k > 0u && typ[i-1u+N*(k-1u)] != 0u && typ[i+N*(k-1u)] != 0u) { lap += u[c-W] - uc; }
+      if (k < prm.nz-1u && typ[i-1u+N*(k+1u)] != 0u && typ[i+N*(k+1u)] != 0u) { lap += u[c+W] - uc; }
+      o[c] = uc + prm.dt*nu*lap/(prm.dx*prm.dx);`),
+    diffW: K([['w', 'f'], ['typ', 'u'], ['nt', 'f'], ['o', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      if (k == 0u || k == prm.nz) { o[c] = w[c]; return; }
+      let b = typ[i+N*(k-1u)]; let t = typ[i+N*k];
+      if (b == 0u || t == 0u || (b != 1u && t != 1u)) { o[c] = w[c]; return; }
+      let nu = prm.nu + 0.5*(nt[i+N*(k-1u)] + nt[i+N*k]);
+      var lap = 0.0; let wc = w[c];
+      if (k > 1u && typ[i+N*(k-2u)] != 0u) { lap += w[c-N] - wc; }
+      if (k < prm.nz-1u && typ[i+N*(k+1u)] != 0u) { lap += w[c+N] - wc; }
+      if (i > 0u && typ[i-1u+N*(k-1u)] != 0u && typ[i-1u+N*k] != 0u) { lap += w[c-1u] - wc; }
+      if (i < N-1u && typ[i+1u+N*(k-1u)] != 0u && typ[i+1u+N*k] != 0u) { lap += w[c+1u] - wc; }
+      o[c] = wc + prm.dt*nu*lap/(prm.dx*prm.dx);`),
+    // implicit drag: porous (Darcy-Forchheimer) and plants (cell arrays A, B per direction),
+    // plus log-law friction on faces that run along a wall: u /= 1 + dt (A + B |u|)
+    dragU: K([['u', 'f'], ['solid', 'u'], ['dg', 'f'], ['ks', 'f'], ['BU', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W; let N = prm.nx;
+      BU[c] = 1.0;
+      if (i == 0u || i == prm.nx) { return; }
+      let l = i-1u+N*k; let r = i+N*k; if (solid[l] != 0u || solid[r] != 0u) { return; }
+      let A = 0.5*(dg[2u*l] + dg[2u*r]); var B = 0.5*(dg[2u*l+1u] + dg[2u*r+1u]);
+      var kw = 0.0;
+      if (k > 0u) { let a = l - N; let b = r - N; if (solid[a] != 0u) { kw = max(kw, ks[a]); } if (solid[b] != 0u) { kw = max(kw, ks[b]); } }
+      if (k < prm.nz-1u) { let a = l + N; let b = r + N; if (solid[a] != 0u) { kw = max(kw, ks[a]); } if (solid[b] != 0u) { kw = max(kw, ks[b]); } }
+      if (kw > 0.0) { let cf = 0.41/max(log(15.0*prm.dx/kw), 2.0); B += cf*cf/prm.dx; }
+      BU[c] = 1.0/(1.0 + prm.dt*(A + B*abs(u[c])));`),
+    dragW: K([['w', 'f'], ['solid', 'u'], ['dg', 'f'], ['ks', 'f'], ['BW', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      BW[c] = 1.0;
+      if (k == 0u || k == prm.nz) { return; }
+      let b = i+N*(k-1u); let t = i+N*k; if (solid[b] != 0u || solid[t] != 0u) { return; }
+      // gravity goes in after diffusion and drag: diffusing the gravity increment next to a wall
+      // would leave a rotational part the pressure solve cannot remove (spurious currents)
+      let A = 0.5*(dg[2u*b] + dg[2u*t]); var B = 0.5*(dg[2u*b+1u] + dg[2u*t+1u]);
+      var kw = 0.0;
+      if (i > 0u) { if (solid[b-1u] != 0u) { kw = max(kw, ks[b-1u]); } if (solid[t-1u] != 0u) { kw = max(kw, ks[t-1u]); } }
+      if (i < N-1u) { if (solid[b+1u] != 0u) { kw = max(kw, ks[b+1u]); } if (solid[t+1u] != 0u) { kw = max(kw, ks[t+1u]); } }
+      if (kw > 0.0) { let cf = 0.41/max(log(15.0*prm.dx/kw), 2.0); B += cf*cf/prm.dx; }
+      BW[c] = 1.0/(1.0 + prm.dt*(A + B*abs(w[c])));
+      w[c] = w[c] - prm.g*prm.dt;`),
   };
 
   // Water renderer: a full-screen triangle; each pixel finds its world point and samples f.
@@ -453,11 +598,11 @@ fn smp(i:i32, k:i32) -> f32 {
     if (data) M.device.queue.writeBuffer(b, 0, data);
     return b;
   }
-  function ubuf() { return M.device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); }
+  function ubuf() { return M.device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); }
   function writeP(b, o) {
-    const ab = new ArrayBuffer(80), u = new Uint32Array(ab), f = new Float32Array(ab);
+    const ab = new ArrayBuffer(96), u = new Uint32Array(ab), f = new Float32Array(ab);
     u[0] = o.nx; u[1] = o.nz; u[2] = o.cnx || 0; u[3] = o.cnz || 0;
-    const fl = [o.dx, o.dt, o.g, o.mode, o.uin, o.hin, o.uout, o.hout, o.S, o.om, o.sx0, o.srate, o.zin, o.zout, o.q, 0];
+    const fl = [o.dx, o.dt, o.g, o.mode, o.uin, o.hin, o.uout, o.hout, o.S, o.om, o.sx0, o.srate, o.zin, o.zout, o.q, o.nu, o.cs, 0, 0, 0];
     for (let j = 0; j < fl.length; j++) f[4 + j] = fl[j] || 0;
     M.device.queue.writeBuffer(b, 0, ab);
   }
@@ -475,7 +620,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const B = {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
-      flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N),
+      flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
@@ -489,9 +634,9 @@ fn smp(i:i32, k:i32) -> f32 {
       const v = L[l]; v.U = ubuf(); writeP(v.U, { nx: v.nx, nz: v.nz });
       const n = v.nx * v.nz;
       if (l === 0) {
-        v.red = D('rbgs0', v.U, [v.typ, v.x, v.b, B.f], n, { COLOR: 0 });
-        v.black = D('rbgs0', v.U, [v.typ, v.x, v.b, B.f], n, { COLOR: 1 });
-        v.res = D('resid0', v.U, [v.typ, v.x, v.b, v.r, B.f], n);
+        v.red = D('rbgs0', v.U, [v.typ, v.x, v.b, B.f, B.BU, B.BW], n, { COLOR: 0 });
+        v.black = D('rbgs0', v.U, [v.typ, v.x, v.b, B.f, B.BU, B.BW], n, { COLOR: 1 });
+        v.res = D('resid0', v.U, [v.typ, v.x, v.b, v.r, B.f, B.BU, B.BW], n);
       } else {
         v.red = D('rbgs', v.U, [v.typ, v.x, v.b], n, { COLOR: 0 });
         v.black = D('rbgs', v.U, [v.typ, v.x, v.b], n, { COLOR: 1 });
@@ -510,21 +655,25 @@ fn smp(i:i32, k:i32) -> f32 {
       exUab: D('extrapU', P0, [B.u, B.uvA, B.u2, B.uvB], NU), exUba: D('extrapU', P0, [B.u2, B.uvB, B.u, B.uvA], NU),
       exWab: D('extrapW', P0, [B.w, B.wvA, B.w2, B.wvB], NW), exWba: D('extrapW', P0, [B.w2, B.wvB, B.w, B.wvA], NW),
       advU: D('advectU', P0, [B.u, B.w, B.u2], NU), advW: D('advectW', P0, [B.u, B.w, B.w2], NW),
+      advFU: D('advFU', P0, [B.u, B.w, B.u2, B.typ], NU), advFW: D('advFW', P0, [B.u, B.w, B.w2, B.typ], NW),
       bcU: D('bcU', P0, [B.u, B.solid, B.tb, B.eta], NU), bcW: D('bcW', P0, [B.w, B.solid], NW),
       inflowF: D('inflowF', P0, [B.f, B.solid, B.eta], nz),
       spongeU: D('spongeU', P0, [B.u], NU), spongeW: D('spongeW', P0, [B.w], NW),
-      rhs: D('rhs', P0, [B.typ, B.u, B.w, B.r, B.p], N),
-      applyA: D('applyA0', P0, [B.typ, B.s, B.q, B.f], N),
+      rhs: D('rhs', P0, [B.typ, B.u, B.w, B.r, B.p, B.BU, B.BW], N),
+      applyA: D('applyA0', P0, [B.typ, B.s, B.q, B.f, B.BU, B.BW], N),
       dotSQ: D('dot', P0, [B.s, B.q, B.part], N, undefined, 256), finSQ: D('fin', P0, [B.part, B.scal], 256, { SLOT: 1, OP: 0 }, 256),
       dotZR: D('dot', P0, [B.z, B.r, B.part], N, undefined, 256),
       fin0: D('fin', P0, [B.part, B.scal], 256, { SLOT: 0, OP: 0 }, 256), fin4: D('fin', P0, [B.part, B.scal], 256, { SLOT: 4, OP: 0 }, 256),
       alpha: D('alpha', P0, [B.scal], 1), beta: D('beta', P0, [B.scal], 1),
       updPR: D('updPR', P0, [B.p, B.r, B.s, B.q, B.scal], N), updS: D('updS', P0, [B.s, B.z, B.scal], N),
-      projU: D('projU', P0, [B.typ, B.p, B.u, B.f], NU), projW: D('projW', P0, [B.typ, B.p, B.w, B.f], NW),
+      projU: D('projU', P0, [B.typ, B.p, B.u, B.f, B.BU], NU), projW: D('projW', P0, [B.typ, B.p, B.w, B.f, B.BW], NW),
       fluxX: D('fluxX', P0, [B.f, B.u, B.flx], NU), fluxZ: D('fluxZ', P0, [B.f, B.w, B.flx], NW),
       updX: D('updX', P0, [B.f, B.f0, B.u, B.flx, B.solid], N), updZ: D('updZ', P0, [B.f, B.f0, B.w, B.flx, B.solid], N),
       surface: D('surface', P0, [B.f, B.solid, B.eta], nx), tick: D('tick', P0, [B.tb], 1),
       speed: D('speed', P0, [B.u, B.w, B.typ, B.tmp], N),
+      nut: D('nut', P0, [B.u, B.w, B.typ, B.nt], N),
+      diffU: D('diffU', P0, [B.u, B.typ, B.nt, B.u2], NU), diffW: D('diffW', P0, [B.w, B.typ, B.nt, B.w2], NW),
+      dragU: D('dragU', P0, [B.u, B.solid, B.dgX, B.ks, B.BU], NU), dragW: D('dragW', P0, [B.w, B.solid, B.dgZ, B.ks, B.BW], NW),
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
@@ -539,12 +688,25 @@ fn smp(i:i32, k:i32) -> f32 {
     M.raster = raster;
     if (!M.ok || !M.S) return;
     const N = M.S.N, solid = new Uint32Array(N), m = raster.mat;
-    // stage 1: solid and sediment are walls; porous and canopy are open water for now
     for (let c = 0; c < N; c++) solid[c] = (m[c] === 1 || m[c] === 4) ? 1 : 0;
     M.device.queue.writeBuffer(M.S.B.solid, 0, solid);
     const e = M.device.createCommandEncoder(), pass = e.beginComputePass();
     run(pass, M.S.d.clearSolid); run(pass, M.S.d.surface); pass.end(); M.device.queue.submit([e.finish()]);
     M.solidHost = solid;
+    // drag per cell (A in 1/s, B in 1/m) for horizontal and vertical flow, and wall roughness ks (m)
+    const dgX = new Float32Array(2 * N), dgZ = new Float32Array(2 * N), ks = new Float32Array(N), nu = NU_WATER;
+    const ksSolid = M.scale === 'field' ? 0.02 : 0.001;
+    for (let c = 0; c < N; c++) {
+      if (m[c] === 2) {              // porous: van Gent (1995) form, superficial velocity
+        const n = Math.min(Math.max(raster.p1[c] || 0.4, 0.05), 0.95), d = Math.max(raster.p2[c] || 0.04, 1e-4);
+        const A = POROUS_ALPHA * (1 - n) * (1 - n) / (n * n * n) * nu / (d * d), B = POROUS_BETA * (1 - n) / (n * n * n) / d;
+        dgX[2 * c] = dgZ[2 * c] = A; dgX[2 * c + 1] = dgZ[2 * c + 1] = B;
+      } else if (m[c] === 3) {       // plants: rigid stems, drag on horizontal flow only
+        dgX[2 * c + 1] = 0.5 * (raster.p2[c] || 1) * (raster.p1[c] || 8);
+      } else if (m[c] === 4) ks[c] = 2.5 * (GRAIN_D[raster.cls[c]] || GRAIN_D[0]);
+      else if (m[c] === 1) ks[c] = ksSolid;
+    }
+    M.device.queue.writeBuffer(M.S.B.dgX, 0, dgX); M.device.queue.writeBuffer(M.S.B.dgZ, 0, dgZ); M.device.queue.writeBuffer(M.S.B.ks, 0, ks);
     M.applyParams();
   };
 
@@ -567,7 +729,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const sponge = river ? 0 : Math.min(Math.max(wl, 0.15 * L), 0.4 * L);
     const P = { nx: g.nx, nz: g.nz, dx: g.dx, dt: M.dt, g: G, mode: river ? 0 : 1,
       uin: river ? p.q / (hin - zIn) : 0, hin, uout: river ? p.q / Math.max(hout - zOut, g.dx) : 0, hout, S, om, sx0: L - sponge, srate: 40 / Math.max(p.T, 0.5),
-      zin: zIn, zout: zOut, q: river ? p.q : 0 };
+      zin: zIn, zout: zOut, q: river ? p.q : 0, nu: NU_WATER, cs: M.turbulence === false ? 0 : CS_SMAG };
     M.P = P;
     if (M.ok && M.S) writeP(M.S.P0, P);
   };
@@ -613,9 +775,13 @@ fn smp(i:i32, k:i32) -> f32 {
     run(pass, d.exUab); run(pass, d.exUba); run(pass, d.exUab); run(pass, d.exWab); run(pass, d.exWba); run(pass, d.exWab);
     pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
-    pass = enc.beginComputePass(); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.advU); run(pass, d.advW); pass.end();
+    pass = enc.beginComputePass(); run(pass, d.bcU); run(pass, d.bcW);
+    if (M.advection === 'sl') { run(pass, d.advU); run(pass, d.advW); } else { run(pass, d.advFU); run(pass, d.advFW); }
+    pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
-    pass = enc.beginComputePass(); run(pass, d.spongeU); run(pass, d.spongeW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.classify); pass.end();
+    pass = enc.beginComputePass(); run(pass, d.spongeU); run(pass, d.spongeW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.nut); run(pass, d.diffU); run(pass, d.diffW); pass.end();
+    enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
+    pass = enc.beginComputePass(); run(pass, d.dragU); run(pass, d.dragW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.classify); pass.end();
     encodePressure(enc);
     pass = enc.beginComputePass();
     run(pass, d.projU); run(pass, d.projW); run(pass, d.bcU); run(pass, d.bcW);
