@@ -200,6 +200,43 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('bed friction: velocity next to the bed is below the velocity near the surface', us > 0.01 && ub > 0 && ub < 0.95 * us, 'bed ' + (ub * 100).toFixed(2) + ' cm/s, near surface ' + (us * 100).toFixed(2) + ' cm/s');
   }
 
+  // ── stage 3: the wave flume ──
+  const WL = require('./wave_lab.js');
+  // 9. small waves follow linear dispersion: wavelength from the phase slope over 37 gauges
+  if (want('dispersion')) {
+    const gauges = []; for (let x = 3; x <= 12.01; x += 0.25) gauges.push(x);
+    const m = await WL.measure(M, { T: 1.6, H: 0.01, gauges });
+    const Lf = WL.wavelengthFit(m), err = Lf / m.Ltheory - 1;
+    check('small waves follow linear dispersion (wavelength within 1%)', isFinite(Lf) && Math.abs(err) < 0.01, Lf.toFixed(3) + ' m, theory ' + m.Ltheory.toFixed(3) + ' m (' + (100 * err).toFixed(2) + '%)');
+  }
+  // 10. the absorbing far end reflects little (incident/reflected split, three gauges)
+  if (want('reflection')) {
+    const m = await WL.measure(M, { T: 1.6, H: 0.04 });
+    check('the absorbing far end reflects under 8% of the wave', isFinite(m.Kr) && m.Hin > 0.02 && m.Kr < 0.08, 'Kr ' + m.Kr.toFixed(3) + ', incident ' + (m.Hin * 100).toFixed(2) + ' cm');
+  }
+  // 11. paddle absorption: a wall at the far end, the incident wave must not build up
+  if (want('absorption')) {
+    const T = 1.6, H = 0.04, h = 0.4, L = 20, nx = L / dx, nz = 0.8 / dx, N = nx * nz;
+    const wl = M.debug.pistonStroke(H, T, h), k = 2 * Math.PI / wl.L, om = 2 * Math.PI / T;
+    const xs = [6, 6 + 0.22 * wl.L, 6 + 0.5 * wl.L], dtw = 0.4 * dx / 1.0;
+    const res = {};
+    for (const absorb of [false, true]) {
+      const rr = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
+      await setup(rr, { type: 'wave', h0: h, H, T, farEnd: 'wall', absorb });
+      const inc = [];
+      for (const until of [20, 60]) {
+        await M.debug.steps(Math.round((until - 6 * T - M.t) / dtw), dtw);
+        const every = Math.max(1, Math.round(T / 32 / dtw)), ts = [], ys = xs.map(() => []);
+        for (let t = 0; t < 6 * T; t += every * dtw) { await M.debug.steps(every, dtw); ts.push(M.t); const e = await M.debug.read('eta'); xs.forEach((x, j) => ys[j].push(e[Math.round(x / dx)] - h)); }
+        inc.push(2 * WL.separate(ys.map(y => WL.harmonic(ts, y, om)), xs, k).aI);
+      }
+      res[absorb] = inc;
+    }
+    check('without paddle absorption, waves reflected from a wall build up (the test can see it)', res[false][1] > 1.3 * res[false][0], (res[false][0] * 100).toFixed(2) + ' -> ' + (res[false][1] * 100).toFixed(2) + ' cm');
+    check('with paddle absorption the incident wave holds (within 8% from 20 s to 60 s)', Math.abs(res[true][1] / res[true][0] - 1) < 0.08, (res[true][0] * 100).toFixed(2) + ' -> ' + (res[true][1] * 100).toFixed(2) + ' cm');
+    M.p.farEnd = 'beach'; M.p.absorb = true;
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

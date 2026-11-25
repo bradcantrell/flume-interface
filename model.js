@@ -28,7 +28,7 @@
   const HEAD = `
 struct P { nx:u32, nz:u32, cnx:u32, cnz:u32, dx:f32, dt:f32, g:f32, mode:f32,
            uin:f32, hin:f32, uout:f32, hout:f32, S:f32, om:f32, sx0:f32, srate:f32,
-           zin:f32, zout:f32, q:f32, nu:f32, cs:f32, pad1:f32, pad2:f32, pad3:f32 };
+           zin:f32, zout:f32, q:f32, nu:f32, cs:f32, amp:f32, absorb:f32, pad3:f32 };
 @group(0) @binding(0) var<uniform> prm: P;
 `;
   const PLIC = `
@@ -89,6 +89,22 @@ fn sW(x:f32, z:f32) -> f32 {
   let i = min(u32(fx), prm.nx - 2u); let k = min(u32(fz), prm.nz - 1u);
   let a = fx - f32(i); let b = fz - f32(k); let i1 = min(i + 1u, prm.nx - 1u); let N = prm.nx;
   return (1.0-b)*((1.0-a)*w[i+N*k] + a*w[i1+N*k]) + b*((1.0-a)*w[i+N*(k+1u)] + a*w[i1+N*(k+1u)]);
+}
+`;
+  const SAMPLE2U = `
+fn sU2(x:f32, z:f32) -> f32 {
+  let fx = clamp(x/prm.dx, 0.0, f32(prm.nx)); let fz = clamp(z/prm.dx - 0.5, 0.0, f32(prm.nz) - 1.0);
+  let i = min(u32(fx), prm.nx - 1u); let k = min(u32(fz), max(prm.nz, 2u) - 2u);
+  let a = fx - f32(i); let b = fz - f32(k); let W = prm.nx + 1u; let k1 = min(k + 1u, prm.nz - 1u);
+  return (1.0-b)*((1.0-a)*u2[i+W*k] + a*u2[i+1u+W*k]) + b*((1.0-a)*u2[i+W*k1] + a*u2[i+1u+W*k1]);
+}
+`;
+  const SAMPLE2W = `
+fn sW2(x:f32, z:f32) -> f32 {
+  let fx = clamp(x/prm.dx - 0.5, 0.0, f32(prm.nx) - 1.0); let fz = clamp(z/prm.dx, 0.0, f32(prm.nz));
+  let i = min(u32(fx), prm.nx - 2u); let k = min(u32(fz), prm.nz - 1u);
+  let a = fx - f32(i); let b = fz - f32(k); let i1 = min(i + 1u, prm.nx - 1u); let N = prm.nx;
+  return (1.0-b)*((1.0-a)*w2[i+N*k] + a*w2[i1+N*k]) + b*((1.0-a)*w2[i+N*(k+1u)] + a*w2[i1+N*(k+1u)]);
 }
 `;
   const NB = `
@@ -234,6 +250,46 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
                     else { var dp = 0.0; if (i + 1u < N) { dp = w[c+1u] - wc; } q = wc - 0.5*mm(wc - w[c-1u], dp); }
         fluxW = vw*q; }
       o[c] = wc - prm.dt/prm.dx*(wn*qn - ws*qs + fluxE - fluxW);`, MM + SAMPLE + AIR),
+    // MacCormack correction for the faces that took the semi-Lagrangian path (next to the surface
+    // or at a high local Courant number): trace forward from the new value, correct by half the
+    // round-trip error, and clamp to the four values around the departure point.
+    // Reads u (old), u2 (after advection); writes o.
+    macU: K([['u', 'f'], ['w', 'f'], ['u2', 'f'], ['o', 'f'], ['typ', 'u']], `let W = prm.nx+1u; let N = prm.nx; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
+      if (i == 0u || i == prm.nx) { o[c] = u2[c]; return; }
+      var nearAir = false;
+      for (var dk = -1; dk <= 1; dk++) { for (var di = -2; di <= 1; di++) { if (isAir(i32(i) + di, i32(k) + dk)) { nearAir = true; } } }
+      let cmax = max(max(abs(u[c-1u]), abs(u[c])), max(abs(u[c+1u]), max(abs(w[i-1u+N*k]), abs(w[i+N*(k+1u)])))) * prm.dt / prm.dx;
+      if (!(nearAir || cmax > 0.45)) { o[c] = u2[c]; return; }
+      let x = f32(i)*prm.dx; let z = (f32(k)+0.5)*prm.dx; let dt = prm.dt;
+      let ww = 0.25*(w[i-1u+N*k] + w[i+N*k] + w[i-1u+N*(k+1u)] + w[i+N*(k+1u)]);
+      let xm = x - 0.5*dt*u[c]; let zm = z - 0.5*dt*ww;
+      let vx = sU(xm, zm); let vz = sW(xm, zm);
+      let xd = x - dt*vx; let zd = z - dt*vz;
+      // forward trace of the advected field from the departure point back to here
+      let back = sU2(xd + dt*vx, zd + dt*vz);
+      let corr = u2[c] + 0.5*(u[c] - back);
+      // limiter: stay within the old values around the departure point
+      let fx = clamp(xd/prm.dx, 0.0, f32(prm.nx)); let fz = clamp(zd/prm.dx - 0.5, 0.0, f32(prm.nz) - 1.0);
+      let i0 = min(u32(fx), prm.nx - 1u); let k0 = min(u32(fz), max(prm.nz, 2u) - 2u); let k1 = min(k0 + 1u, prm.nz - 1u);
+      let a = u[i0+W*k0]; let b = u[i0+1u+W*k0]; let cc = u[i0+W*k1]; let d = u[i0+1u+W*k1];
+      o[c] = clamp(corr, min(min(a, b), min(cc, d)), max(max(a, b), max(cc, d)));`, SAMPLE + SAMPLE2U + AIR),
+    macW: K([['u', 'f'], ['w', 'f'], ['w2', 'f'], ['o', 'f'], ['typ', 'u']], `let W = prm.nx+1u; let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      if (k == 0u || k == prm.nz) { o[c] = w2[c]; return; }
+      var nearAir = false;
+      for (var dk = -2; dk <= 1; dk++) { for (var di = -1; di <= 1; di++) { if (isAir(i32(i) + di, i32(k) + dk)) { nearAir = true; } } }
+      let cmax = max(max(abs(w[c-N]), abs(w[c])), max(abs(w[c+N]), max(abs(u[i+W*k]), abs(u[i+1u+W*(k-1u)])))) * prm.dt / prm.dx;
+      if (!(nearAir || cmax > 0.45)) { o[c] = w2[c]; return; }
+      let x = (f32(i)+0.5)*prm.dx; let z = f32(k)*prm.dx; let dt = prm.dt;
+      let uu = 0.25*(u[i+W*(k-1u)] + u[i+1u+W*(k-1u)] + u[i+W*k] + u[i+1u+W*k]);
+      let xm = x - 0.5*dt*uu; let zm = z - 0.5*dt*w[c];
+      let vx = sU(xm, zm); let vz = sW(xm, zm);
+      let xd = x - dt*vx; let zd = z - dt*vz;
+      let back = sW2(xd + dt*vx, zd + dt*vz);
+      let corr = w2[c] + 0.5*(w[c] - back);
+      let fx = clamp(xd/prm.dx - 0.5, 0.0, f32(prm.nx) - 1.0); let fz = clamp(zd/prm.dx, 0.0, f32(prm.nz));
+      let i0 = min(u32(fx), prm.nx - 2u); let k0 = min(u32(fz), prm.nz - 1u); let i1 = min(i0 + 1u, prm.nx - 1u);
+      let a = w[i0+N*k0]; let b = w[i1+N*k0]; let cc = w[i0+N*(k0+1u)]; let d = w[i1+N*(k0+1u)];
+      o[c] = clamp(corr, min(min(a, b), min(cc, d)), max(max(a, b), max(cc, d)));`, SAMPLE + SAMPLE2W + AIR),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -244,7 +300,17 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
         // every face with any part below the inlet surface e carries q / (e - zin); fluxX takes the
         // wet fraction of each face, so exactly q dt comes in per step
         if (prm.mode < 0.5) { let e = max(eta[0], prm.zin + prm.dx); u[c] = select(0.0, prm.q*ramp/(e - prm.zin), f32(k)*prm.dx < e); }
-        else { let t = tb[0]; let rw = min(t*prm.om/12.566371, 1.0); u[c] = 0.5*prm.S*prm.om*sin(prm.om*t)*rw; }
+        else {
+          // piston paddle; with absorption it also corrects by the level it sees at its face, so
+          // waves coming back from the flume are absorbed instead of re-reflected
+          let t = tb[0]; let rw = min(t*prm.om/12.566371, 1.0);
+          var up = 0.5*prm.S*prm.om*sin(prm.om*t)*rw;
+          if (prm.absorb > 0.5 && eta[0] > 0.0) {
+            let h = max(prm.hin - prm.zin, prm.dx);
+            up -= sqrt(prm.g/h)*((eta[0] - prm.hin) - prm.amp*sin(prm.om*t)*rw);
+          }
+          u[c] = up;
+        }
         return; }
       if (i == prm.nx) {
         if (solid[prm.nx-1u+prm.nx*k] != 0u || prm.mode > 0.5) { u[c] = 0.0; return; }
@@ -492,8 +558,8 @@ fn smp(i:i32, k:i32) -> f32 {
 
   // ───────────────────────── model ─────────────────────────
   const DEFAULTS = {
-    lab:   { type: 'river', h0: 0.40, q: 0.10, hout: 0.40, H: 0.08, T: 2.0, speed: 1 },
-    field: { type: 'river', h0: 6.0, q: 6.0, hout: 6.0, H: 1.5, T: 8.0, speed: 1 },
+    lab:   { type: 'river', h0: 0.40, q: 0.10, hout: 0.40, H: 0.08, T: 2.0, speed: 1, farEnd: 'beach', absorb: true },
+    field: { type: 'river', h0: 6.0, q: 6.0, hout: 6.0, H: 1.5, T: 8.0, speed: 1, farEnd: 'beach', absorb: true },
   };
 
   const M = {
@@ -517,6 +583,8 @@ fn smp(i:i32, k:i32) -> f32 {
       <div class="row m-river"><label for="m-hout">tailwater depth (m)</label><input id="m-hout" type="number" step="0.01" min="0"></div>
       <div class="row m-wave"><label for="m-wh">wave height (m)</label><input id="m-wh" type="number" step="0.01" min="0"></div>
       <div class="row m-wave"><label for="m-wt">wave period (s)</label><input id="m-wt" type="number" step="0.1" min="0.3"></div>
+      <div class="row m-wave"><label for="m-far">far end</label><select id="m-far"><option value="beach">absorbing</option><option value="wall">wall (reflects)</option></select></div>
+      <div class="row m-wave"><label for="m-abs">paddle absorbs</label><select id="m-abs"><option value="1">yes</option><option value="0">no</option></select></div>
       <div class="row"><label for="m-color">water colour</label>
         <select id="m-color"><option value="0">depth</option><option value="1">speed</option></select></div>`,
     wire() {
@@ -528,6 +596,8 @@ fn smp(i:i32, k:i32) -> f32 {
       });
       $('m-type').addEventListener('change', (e) => { M.p.type = e.target.value; M.syncControls(); M.applyParams(); M.reset(); M.api && M.api.changed(); });
       $('m-color').addEventListener('change', (e) => { M.colorMode = +e.target.value; });
+      $('m-far').addEventListener('change', (e) => { M.p.farEnd = e.target.value; M.applyParams(); M.api && M.api.changed(); });
+      $('m-abs').addEventListener('change', (e) => { M.p.absorb = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
       M.syncControls();
     },
   };
@@ -536,7 +606,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const $ = (id) => document.getElementById(id), p = M.p;
     const set = (id, v) => { const el = $(id); if (el) el.value = String(+v.toFixed(4)); };
     if (!$('m-type')) return;
-    $('m-type').value = p.type; set('m-h0', p.h0); set('m-q', p.q); set('m-hout', p.hout); set('m-wh', p.H); set('m-wt', p.T);
+    $('m-type').value = p.type; $('m-far').value = p.farEnd === 'wall' ? 'wall' : 'beach'; $('m-abs').value = p.absorb === false ? '0' : '1'; set('m-h0', p.h0); set('m-q', p.q); set('m-hout', p.hout); set('m-wh', p.H); set('m-wt', p.T);
     for (const el of document.querySelectorAll('.m-river')) el.style.display = p.type === 'river' ? '' : 'none';
     for (const el of document.querySelectorAll('.m-wave')) el.style.display = p.type === 'wave' ? '' : 'none';
   };
@@ -544,11 +614,17 @@ fn smp(i:i32, k:i32) -> f32 {
   M.state = function () { return Object.assign({}, M.p, { colorMode: M.colorMode }); };
   M.setState = function (s) {
     if (!s) return;
-    for (const k of Object.keys(DEFAULTS.lab)) if (s[k] != null && (k === 'type' ? (s[k] === 'river' || s[k] === 'wave') : isFinite(+s[k]))) M.p[k] = k === 'type' ? s[k] : +s[k];
+    for (const k of Object.keys(DEFAULTS.lab)) {
+      if (s[k] == null) continue;
+      if (k === 'type') { if (s[k] === 'river' || s[k] === 'wave') M.p.type = s[k]; }
+      else if (k === 'farEnd') M.p.farEnd = s[k] === 'wall' ? 'wall' : 'beach';
+      else if (k === 'absorb') M.p.absorb = !!s[k];
+      else if (isFinite(+s[k])) M.p[k] = +s[k];
+    }
     if (s.colorMode != null) M.colorMode = +s.colorMode;
     M.syncControls(); if (M.grid) M.applyParams();
   };
-  M.setScale = function (scale) { M.scale = scale; M.p = Object.assign({}, DEFAULTS[scale] || DEFAULTS.lab, { type: M.p.type }); M.syncControls(); if (M.grid) M.applyParams(); };
+  M.setScale = function (scale) { M.scale = scale; M.p = Object.assign({}, DEFAULTS[scale] || DEFAULTS.lab, { type: M.p.type, farEnd: M.p.farEnd, absorb: M.p.absorb }); M.syncControls(); if (M.grid) M.applyParams(); };
 
   M.init = async function (api) {
     M.api = api || null;
@@ -604,7 +680,7 @@ fn smp(i:i32, k:i32) -> f32 {
   function writeP(b, o) {
     const ab = new ArrayBuffer(96), u = new Uint32Array(ab), f = new Float32Array(ab);
     u[0] = o.nx; u[1] = o.nz; u[2] = o.cnx || 0; u[3] = o.cnz || 0;
-    const fl = [o.dx, o.dt, o.g, o.mode, o.uin, o.hin, o.uout, o.hout, o.S, o.om, o.sx0, o.srate, o.zin, o.zout, o.q, o.nu, o.cs, 0, 0, 0];
+    const fl = [o.dx, o.dt, o.g, o.mode, o.uin, o.hin, o.uout, o.hout, o.S, o.om, o.sx0, o.srate, o.zin, o.zout, o.q, o.nu, o.cs, o.amp, o.absorb, 0];
     for (let j = 0; j < fl.length; j++) f[4 + j] = fl[j] || 0;
     M.device.queue.writeBuffer(b, 0, ab);
   }
@@ -622,7 +698,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const B = {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
-      flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW),
+      flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
@@ -658,6 +734,7 @@ fn smp(i:i32, k:i32) -> f32 {
       exWab: D('extrapW', P0, [B.w, B.wvA, B.w2, B.wvB], NW), exWba: D('extrapW', P0, [B.w2, B.wvB, B.w, B.wvA], NW),
       advU: D('advectU', P0, [B.u, B.w, B.u2], NU), advW: D('advectW', P0, [B.u, B.w, B.w2], NW),
       advFU: D('advFU', P0, [B.u, B.w, B.u2, B.typ], NU), advFW: D('advFW', P0, [B.u, B.w, B.w2, B.typ], NW),
+      macU: D('macU', P0, [B.u, B.w, B.u2, B.uM, B.typ], NU), macW: D('macW', P0, [B.u, B.w, B.w2, B.wM, B.typ], NW),
       bcU: D('bcU', P0, [B.u, B.solid, B.tb, B.eta], NU), bcW: D('bcW', P0, [B.w, B.solid], NW),
       spongeU: D('spongeU', P0, [B.u], NU), spongeW: D('spongeW', P0, [B.w], NW),
       rhs: D('rhs', P0, [B.typ, B.u, B.w, B.r, B.p, B.BU, B.BW], N),
@@ -707,6 +784,7 @@ fn smp(i:i32, k:i32) -> f32 {
       } else if (m[c] === 4) ks[c] = 2.5 * (GRAIN_D[raster.cls[c]] || GRAIN_D[0]);
       else if (m[c] === 1) ks[c] = ksSolid;
     }
+    if (M.wallFriction === false) ks.fill(0);       // for tests: walls and bed without friction
     M.device.queue.writeBuffer(M.S.B.dgX, 0, dgX); M.device.queue.writeBuffer(M.S.B.dgZ, 0, dgZ); M.device.queue.writeBuffer(M.S.B.ks, 0, ks);
     M.applyParams();
   };
@@ -727,10 +805,11 @@ fn smp(i:i32, k:i32) -> f32 {
     if (!river && p.H > 0 && p.T > 0) { const w = pistonStroke(p.H, p.T, p.h0 - zIn); S = w.S; om = w.om; wl = w.L; }
     if (river) om = 1 / Math.max(2, 0.5 * L / Math.sqrt(G * Math.max(p.h0 - zIn, g.dx)));   // soft start
     M.wave = { S, om, L: wl };
-    const sponge = river ? 0 : Math.min(Math.max(wl, 0.15 * L), 0.4 * L);
+    const sponge = river || p.farEnd === 'wall' ? 0 : Math.min(Math.max(wl, 0.15 * L), 0.4 * L);
     const P = { nx: g.nx, nz: g.nz, dx: g.dx, dt: M.dt, g: G, mode: river ? 0 : 1,
       uin: river ? p.q / (hin - zIn) : 0, hin, uout: river ? p.q / Math.max(hout - zOut, g.dx) : 0, hout, S, om, sx0: L - sponge, srate: 40 / Math.max(p.T, 0.5),
-      zin: zIn, zout: zOut, q: river ? p.q : 0, nu: NU_WATER, cs: M.turbulence === false ? 0 : CS_SMAG };
+      zin: zIn, zout: zOut, q: river ? p.q : 0, nu: NU_WATER, cs: M.turbulence === false ? 0 : CS_SMAG,
+      amp: river ? 0 : 0.5 * (p.H || 0), absorb: !river && p.absorb !== false && p.absorb !== 0 ? 1 : 0 };
     M.P = P;
     if (M.ok && M.S) writeP(M.S.P0, P);
   };
@@ -777,8 +856,12 @@ fn smp(i:i32, k:i32) -> f32 {
     pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
     pass = enc.beginComputePass(); run(pass, d.bcU); run(pass, d.bcW);
-    if (M.advection === 'sl') { run(pass, d.advU); run(pass, d.advW); } else { run(pass, d.advFU); run(pass, d.advFW); }
-    pass.end();
+    if (M.advection === 'sl') { run(pass, d.advU); run(pass, d.advW); pass.end(); }
+    else if (M.maccormack === false) { run(pass, d.advFU); run(pass, d.advFW); pass.end(); }
+    else {
+      run(pass, d.advFU); run(pass, d.advFW); run(pass, d.macU); run(pass, d.macW); pass.end();
+      enc.copyBufferToBuffer(B.uM, 0, B.u2, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.wM, 0, B.w2, 0, M.S.NW * 4);
+    }
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
     pass = enc.beginComputePass(); run(pass, d.spongeU); run(pass, d.spongeW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.nut); run(pass, d.diffU); run(pass, d.diffW); pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);

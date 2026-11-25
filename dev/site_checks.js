@@ -53,7 +53,9 @@ check('Allrun cuts the solids out, installs the zones, sets the water, and runs'
 const rw = raster(CASES.wave, dx), Fw = FLUME_CASE.files({ grid: { nx: rw.nx, nz: rw.nz, dx }, raster: rw, p: CASES.wave.p, sx0: 16, endTime: 20, scale: 'lab' });
 check('wave case: Airy waves at the inlet with the asked height and period, closed far end', Fw['0/U'].includes('waveVelocity') && /amplitude\s+table \(\(0 0\) \(3\.2 0\.03\)\);/.test(Fw['constant/waveProperties']) && /scale\s+constant 1;/.test(Fw['constant/waveProperties']) && /period\s+1\.6;/.test(Fw['constant/waveProperties']) && /outlet\s*\{\s*type wall;/.test(Fw['system/blockMeshDict']));
 check('wave case: damping over the sponge, from x = 16 m', /isotropicDamping[\s\S]*origin\s+\(16 0 0\)/.test(Fw['constant/fvModels']));
-check('turbulence: k-epsilon in both flumes', /kEpsilon/.test(F['constant/momentumTransport']) && /kEpsilon/.test(Fw['constant/momentumTransport']));
+check('turbulence: k-epsilon by default', /kEpsilon/.test(F['constant/momentumTransport']) && /kEpsilon/.test(Fw['constant/momentumTransport']));
+const Fl = FLUME_CASE.files({ grid: { nx: rw.nx, nz: rw.nz, dx }, raster: rw, p: CASES.wave.p, sx0: 16, endTime: 20, scale: 'lab', turbulence: 'laminar' });
+check('turbulence: laminar when asked, without k, epsilon and nut fields', /simulationType\s+laminar;/.test(Fl['constant/momentumTransport']) && !('0/k' in Fl) && !('0/nut' in Fl) && !('0/epsilon' in Fl));
 check('wave case: no zone file when nothing is porous or planted', !('system/cellZones' in Fw) && !/cellZones/.test(Fw['Allrun']));
 
 // the ZIP opens and Allrun is executable

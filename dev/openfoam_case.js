@@ -10,6 +10,8 @@ const out = process.argv[2], which = process.argv[3] || 'weir', endTime = +(proc
 const CASES = {
   weir: { L: 8, H: 0.6, paint: (x, z) => (z < 0.02 ? 4 : (x > 3 && x < 3.4 && z < 0.22) ? 1 : 0), p: { type: 'river', h0: 0.22 + 1.6 * Math.cbrt(0.03 * 0.03 / 9.81), q: 0.03, hout: 0.05 } },
   porous: { L: 8, H: 0.5, paint: (x, z) => (z < 0.02 ? 4 : (x > 3 && x < 4) ? 2 : 0), p1: 0.4, p2: 0.02, p: { type: 'river', h0: 0.32, q: 0.005, hout: 0.28 } },
+  // non-breaking waves over a gentle bar (crest 0.2 m under the surface, 1:5 slopes), laminar
+  wave2: { L: 20, H: 0.8, paint: (x, z) => (z < 0.02 ? 4 : (z < 0.02 + Math.max(0, Math.min(0.2, 0.2 - (Math.abs(x - 9) - 0.75) / 5))) ? 1 : 0), p: { type: 'wave', h0: 0.42, H: 0.03, T: 1.6, absorb: false }, turbulence: 'laminar' },
   wave: { L: 20, H: 0.8, paint: (x, z) => (z < 0.02 ? 4 : (Math.abs(x - 9) < 1.5 - z * 2 && z < 0.28) ? 1 : 0), p: { type: 'wave', h0: 0.42, H: 0.06, T: 1.6 } },
 };
 const C = CASES[which];
@@ -22,7 +24,7 @@ function raster(C, dx) {
 module.exports = { CASES, raster };
 if (require.main === module) {
   const r = raster(C, dx), L = r.nx * dx;
-  const F = FLUME_CASE.files({ grid: { nx: r.nx, nz: r.nz, dx }, raster: r, p: C.p, sx0: L - Math.min(Math.max(2.84, 0.15 * L), 0.4 * L), endTime, scale: 'lab' });
+  const F = FLUME_CASE.files({ grid: { nx: r.nx, nz: r.nz, dx }, raster: r, p: C.p, sx0: L - Math.min(Math.max(2.84, 0.15 * L), 0.4 * L), endTime, scale: 'lab', turbulence: C.turbulence });
   for (const [name, text] of Object.entries(F)) { const f = path.join(out, name); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); }
   fs.chmodSync(path.join(out, 'Allrun'), 0o755);
   console.log('wrote', Object.keys(F).length, 'files to', out, '(' + r.nx + ' x ' + r.nz + ')');

@@ -88,10 +88,12 @@ boundary
     F['constant/phaseProperties'] = head('dictionary', 'phaseProperties', 'constant') + 'phases          (water air);\n\nsigma           0.07;\n';
     F['constant/physicalProperties.water'] = head('dictionary', 'physicalProperties.water', 'constant') + 'viscosityModel  constant;\n\nnu              1e-06;\n\nrho             1000;\n';
     F['constant/physicalProperties.air'] = head('dictionary', 'physicalProperties.air', 'constant') + 'viscosityModel  constant;\n\nnu              1.48e-05;\n\nrho             1;\n';
-    // k-epsilon with rough walls. For waves, OpenFOAM's tutorial runs laminar, but a laminar test with
-    // waves breaking over a bar never finished (the time step collapsed); k-epsilon damps waves
-    // somewhat (about 20% over 10 m in that test), so wave heights are on the low side.
-    F['constant/momentumTransport'] = head('dictionary', 'momentumTransport', 'constant') + 'simulationType  RAS;\n\nRAS\n{\n    model           kEpsilon;\n    turbulence      on;\n    printCoeffs     on;\n}\n';
+    // turbulence: k-epsilon with rough walls, or laminar (o.turbulence). OpenFOAM's wave tutorial runs
+    // laminar, and k-epsilon damps surface waves (20 to 30% over 10 m in a test); but a laminar run
+    // with waves breaking over a bar never finished (its time step collapsed).
+    const laminar = o.turbulence === 'laminar';
+    F['constant/momentumTransport'] = head('dictionary', 'momentumTransport', 'constant') + (laminar ? 'simulationType  laminar;\n'
+      : 'simulationType  RAS;\n\nRAS\n{\n    model           kEpsilon;\n    turbulence      on;\n    printCoeffs     on;\n}\n');
 
     // porosityForce: S = -(mu d + rho |U| f / 2) U, so d = A / nu and f = 2 B (model's A, B)
     let fvModels = '';
@@ -189,9 +191,9 @@ crossScale      constant 1;
     F['0/alpha.water'] = field('volScalarField', 'alpha.water', '[0 0 0 0 0 0 0]', 'uniform 0', { inlet: inA, outlet: river ? 'type            zeroGradient;' : wall.a, lowerWall: wall.a, walls: wall.a, atmosphere: 'type            inletOutlet;\ninletValue      uniform 0;\nvalue           uniform 0;' });
     F['0/p_rgh'] = field('volScalarField', 'p_rgh', '[1 -1 -2 0 0 0 0]', 'uniform 0', { inlet: river ? 'type            zeroGradient;' : wall.p, outlet: river ? 'type            zeroGradient;' : wall.p, lowerWall: wall.p, walls: wall.p, atmosphere: 'type            prghTotalPressure;\np0              uniform 0;\nvalue           uniform 0;' });
     const free = (v) => `type            inletOutlet;\ninletValue      uniform ${num(v)};\nvalue           uniform ${num(v)};`;
-    F['0/k'] = field('volScalarField', 'k', '[0 2 -2 0 0 0 0]', 'uniform ' + num(kIn), { inlet: river ? `type            fixedValue;\nvalue           uniform ${num(kIn)};` : free(kIn), outlet: river ? free(kIn) : wall.k, lowerWall: wall.k, walls: wall.k, atmosphere: free(kIn) });
-    F['0/epsilon'] = field('volScalarField', 'epsilon', '[0 2 -3 0 0 0 0]', 'uniform ' + num(epsIn), { inlet: river ? `type            fixedValue;\nvalue           uniform ${num(epsIn)};` : free(epsIn), outlet: river ? free(epsIn) : wall.e, lowerWall: wall.e, walls: wall.e, atmosphere: free(epsIn) });
-    F['0/nut'] = field('volScalarField', 'nut', '[0 2 -1 0 0 0 0]', 'uniform 0', { inlet: 'type            calculated;\nvalue           uniform 0;', outlet: river ? 'type            calculated;\nvalue           uniform 0;' : wall.nut, lowerWall: wall.nut, walls: wall.nut, atmosphere: 'type            calculated;\nvalue           uniform 0;' });
+    if (!laminar) F['0/k'] = field('volScalarField', 'k', '[0 2 -2 0 0 0 0]', 'uniform ' + num(kIn), { inlet: river ? `type            fixedValue;\nvalue           uniform ${num(kIn)};` : free(kIn), outlet: river ? free(kIn) : wall.k, lowerWall: wall.k, walls: wall.k, atmosphere: free(kIn) });
+    if (!laminar) F['0/epsilon'] = field('volScalarField', 'epsilon', '[0 2 -3 0 0 0 0]', 'uniform ' + num(epsIn), { inlet: river ? `type            fixedValue;\nvalue           uniform ${num(epsIn)};` : free(epsIn), outlet: river ? free(epsIn) : wall.e, lowerWall: wall.e, walls: wall.e, atmosphere: free(epsIn) });
+    if (!laminar) F['0/nut'] = field('volScalarField', 'nut', '[0 2 -1 0 0 0 0]', 'uniform 0', { inlet: 'type            calculated;\nvalue           uniform 0;', outlet: river ? 'type            calculated;\nvalue           uniform 0;' : wall.nut, lowerWall: wall.nut, walls: wall.nut, atmosphere: 'type            calculated;\nvalue           uniform 0;' });
 
     F['system/setFieldsDict'] = head('dictionary', 'setFieldsDict', 'system') + `defaultValues
 {
@@ -361,8 +363,8 @@ empty file named \`case.foam\`.
 
 - The mesh is the browser's grid, one cell thick. Solid and sediment cells are cut out
   (\`subsetMesh\`), and their faces become the \`walls\` patch.
-- Turbulence is k-epsilon with rough wall functions (Ks = ${num(ksBed)} m, from the bed's grain size).
-  The browser uses a Smagorinsky eddy viscosity and log-law friction.
+- ${laminar ? 'Turbulence is off (laminar), as OpenFOAM\'s wave tutorial. If the waves break and the time step\n  collapses, export again with k-epsilon.' : `Turbulence is k-epsilon with rough wall functions (Ks = \${num(ksBed)} m, from the bed's grain size).
+  k-epsilon damps surface waves somewhat.`} The browser uses a Smagorinsky eddy viscosity and log-law friction.
 - Porous areas use OpenFOAM's Darcy-Forchheimer porosity with the browser's coefficients;
   plants are a Forchheimer term on horizontal flow only.
 - Sediment does not move in this case. It is the flow over the starting bed.
@@ -405,13 +407,17 @@ if (typeof registerBackend === 'function') registerBackend({
   mount(slot) {
     slot.innerHTML = `<h2>OpenFOAM</h2>
       <div class="row"><label for="of-end">run time (s)</label><input id="of-end" type="number" min="1" step="1" value="60"></div>
+      <div class="row"><label for="of-turb">turbulence</label><select id="of-turb"><option value="auto">auto</option><option value="kEpsilon">k-epsilon</option><option value="laminar">none (laminar)</option></select></div>
       <div class="btns"><button id="of-export">export case</button></div>
       <p class="note">A 2D case of this flume for OpenFOAM 12 or later, with this scene inside.</p>`;
     document.getElementById('of-export').addEventListener('click', () => {
       const end = Math.max(1, parseFloat(document.getElementById('of-end').value) || 60);
       const p = model && model.state ? model.state() : { type: 'river', h0: 0.4, q: 0.1, hout: 0.4, H: 0.08, T: 2 };
       const sx0 = model && model.P ? model.P.sx0 : 0.8 * DOMAIN.L;
-      const F = FLUME_CASE.files({ grid: GRID, raster: RASTER, p, sx0, endTime: end, scale: DOMAIN.scale, sceneText: sceneFileText() });
+      // auto: k-epsilon for a river, laminar for waves (choose k-epsilon when the waves break)
+      let turbulence = document.getElementById('of-turb').value;
+      if (turbulence === 'auto') turbulence = p.type === 'wave' ? 'laminar' : 'kEpsilon';
+      const F = FLUME_CASE.files({ grid: GRID, raster: RASTER, p, sx0, endTime: end, scale: DOMAIN.scale, sceneText: sceneFileText(), turbulence });
       const a = document.createElement('a'); a.href = URL.createObjectURL(FLUME_CASE.zip(F, 'flume-case')); a.download = 'flume-case.zip';
       document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
     });
