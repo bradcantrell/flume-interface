@@ -33,7 +33,7 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
   }
   async function setup(r, params) {
     M.device.pushErrorScope('validation');
-    M.setScale('lab'); Object.assign(M.p, params);
+    M.setScale('lab'); Object.assign(M.p, { sediment: false }, params);   // the moving bed is off unless a check turns it on
     M.setGrid({ nx: r.nx, nz: r.nz, dx: r.dx }, r); M.reset();
     const err = await M.device.popErrorScope();
     return err ? err.message : null;
@@ -235,6 +235,121 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('without paddle absorption, waves reflected from a wall build up (the test can see it)', res[false][1] > 1.3 * res[false][0], (res[false][0] * 100).toFixed(2) + ' -> ' + (res[false][1] * 100).toFixed(2) + ' cm');
     check('with paddle absorption the incident wave holds (within 8% from 20 s to 60 s)', Math.abs(res[true][1] / res[true][0] - 1) < 0.08, (res[true][0] * 100).toFixed(2) + ' -> ' + (res[true][1] * 100).toFixed(2) + ' cm');
     M.p.farEnd = 'beach'; M.p.absorb = true;
+  }
+
+  // ── stage 4: sediment ──
+  const readBed = async () => { const b = await M.debug.read('bed'), n = b.length / 3, zs = new Float32Array(n), zf = new Float32Array(n); for (let i = 0; i < n; i++) { zs[i] = b[3 * i]; zf[i] = b[3 * i + 1]; } return { zs, zf }; };
+  const bedVolume = (b) => { let v = 0; for (let i = 0; i < b.zs.length; i++) if (b.zs[i] >= 0) v += b.zs[i] - b.zf[i]; return v; };
+  const sandFlume = (L, Hd, d, zb, cls, extra) => flume(L, Hd, d, (x, z) => (z < 0.02 ? 1 : z < zb(x) ? 4 : (extra ? extra(x, z) : 0)));
+  const setCls = (r, cls) => { for (let c = 0; c < r.mat.length; c++) if (r.mat[c] === 4) r.cls[c] = cls; return r; };
+  // 12. still water: the bed does not move
+  if (want('sedstill')) {
+    const rr = setCls(sandFlume(6, 0.6, dx, () => 0.12), 0);
+    await setup(rr, { type: 'river', h0: 0.40, q: 0, hout: 0.38, sediment: true, morfac: 20 });
+    const b0 = await readBed(); await M.debug.steps(600, stepFor(dx, 1.0)); const b1 = await readBed();
+    let mx = 0; for (let i = 0; i < b0.zs.length; i++) mx = Math.max(mx, Math.abs(b1.zs[i] - b0.zs[i]));
+    check('still water: the bed does not move', mx < 1e-5, 'largest change ' + (mx * 1000).toFixed(3) + ' mm');
+  }
+  // 13. the bedload the GPU computes is Meyer-Peter & Mueller for the bed shear it computed
+  if (want('sedmpm')) {
+    const rr = setCls(sandFlume(8, 0.6, dx, () => 0.10), 0);
+    await setup(rr, { type: 'river', h0: 0.36, q: 0.12, hout: 0.26, sediment: true, morfac: 1 });
+    await M.debug.steps(Math.round(15 / stepFor(dx, 1.0)), stepFor(dx, 1.0));
+    const ust = await M.debug.read('ust'), qc = await M.debug.read('qc'), gp = M.debug.grainProps(0.0002), R = 1.65;
+    let worst = 0, nmov = 0;
+    for (let i = 100; i < 300; i += 10) {
+      const th = ust[i] * ust[i] / (R * 9.81 * 0.0002), q = 8 * Math.pow(Math.max(th - gp.thc, 0), 1.5) * Math.sqrt(R * 9.81 * 0.0002 ** 3);
+      if (q > 0) { nmov++; worst = Math.max(worst, Math.abs(Math.abs(qc[3 * i]) - q) / q); }
+    }
+    check('bedload rate is Meyer-Peter & Mueller for the bed shear (fine sand, within 1%)', nmov >= 10 && worst < 0.01, nmov + ' columns moving, worst ' + (100 * worst).toFixed(3) + '%, critical Shields ' + gp.thc.toFixed(4));
+  }
+  // 14. a closed wave flume keeps its bedload sediment (coarse sand, which stays on the bed)
+  if (want('sedmass')) {
+    const rr = setCls(sandFlume(12, 0.8, dx, (x) => 0.08 + 0.025 * x), 1);
+    await setup(rr, { type: 'wave', h0: 0.42, H: 0.14, T: 2.0, farEnd: 'wall', absorb: true, sediment: true, morfac: 20 });
+    const b0 = await readBed(); await M.debug.steps(Math.round(30 / stepFor(dx, 1.0)), stepFor(dx, 1.0)); const b1 = await readBed();
+    const v0 = bedVolume(b0), v1 = bedVolume(b1); let moved = 0; for (let i = 0; i < b0.zs.length; i++) moved = Math.max(moved, Math.abs(b1.zs[i] - b0.zs[i]));
+    check('a closed wave flume keeps its sediment (bed volume within 0.1%)', moved > 0.002 && Math.abs(v1 - v0) / v0 < 0.001, 'volume ' + (100 * (v1 - v0) / v0).toFixed(4) + '%, largest bed change ' + (moved * 100).toFixed(1) + ' cm');
+  }
+  // 15. a 45 degree mound slumps to the angle of repose (32 degrees) and keeps its volume
+  if (want('repose')) {
+    const rr = setCls(sandFlume(6, 0.8, dx, (x) => 0.08 + Math.max(0, 0.4 - Math.abs(x - 3))), 1);
+    await setup(rr, { type: 'river', h0: 0.70, q: 0, hout: 0.68, sediment: true, morfac: 1 });
+    const b0 = await readBed(); await M.debug.steps(300, stepFor(dx, 1.0)); const b1 = await readBed();
+    let smax = 0; for (let i = 1; i < b1.zs.length; i++) if (b1.zs[i] >= 0 && b1.zs[i - 1] >= 0) smax = Math.max(smax, Math.abs(b1.zs[i] - b1.zs[i - 1]) / dx);
+    const v0 = bedVolume(b0), v1 = bedVolume(b1), tanp = Math.tan(32 * Math.PI / 180);
+    check('a 45 degree mound slumps to the angle of repose and keeps its volume', smax <= tanp + 0.01 && Math.abs(v1 - v0) / v0 < 1e-4, 'steepest ' + (Math.atan(smax) * 180 / Math.PI).toFixed(1) + ' degrees (repose 32), volume ' + (100 * (v1 - v0) / v0).toFixed(5) + '%');
+  }
+  // 16. a strong river over a sill digs a scour hole downstream of it
+  if (want('scour')) {
+    const rr = setCls(sandFlume(10, 0.6, dx, () => 0.10, 1, (x, z) => (x > 4 && x < 4.3 && z < 0.20 ? 1 : 0)), 1);
+    await setup(rr, { type: 'river', h0: 0.36, q: 0.15, hout: 0.22, sediment: true, morfac: 30 });
+    const b0 = await readBed(); await M.debug.steps(Math.round(20 / stepFor(dx, 1.5)), stepFor(dx, 1.5)); const b1 = await readBed();
+    let lo = 0, xlo = 0; for (let i = Math.round(4.3 / dx); i < Math.round(6.5 / dx); i++) { const d = b1.zs[i] - b0.zs[i]; if (d < lo) { lo = d; xlo = i * dx; } }
+    let up = 0; for (let i = Math.round(1 / dx); i < Math.round(3 / dx); i++) up = Math.min(up, b1.zs[i] - b0.zs[i]);
+    check('a river over a sill scours the bed just downstream of it', lo < -0.01 && xlo < 5.5 && lo < 2 * up, 'deepest ' + (lo * 100).toFixed(1) + ' cm at x = ' + xlo.toFixed(2) + ' m (sill ends at 4.3 m), upstream reach ' + (up * 100).toFixed(1) + ' cm');
+  }
+
+  // 17. settling column: fine sand starts mixed through still water over a gravel bed; half has
+  //     settled out at t = h / (2 ws)
+  if (want('settling')) {
+    const rr = setCls(sandFlume(2, 0.6, dx, () => 0.10), 2);
+    await setup(rr, { type: 'river', h0: 0.50, q: 0, hout: 0.48, sediment: true, morfac: 1 });
+    const N = rr.nx * rr.nz, f0 = await M.debug.read('f'), cs = new Float32Array(3 * N), C0 = 0.001;
+    for (let c = 0; c < N; c++) if (f0[c] > 0.999 && rr.mat[c] === 0) cs[3 * c] = C0;
+    M.debug.write('cs', cs);
+    const mass = async () => { const c2 = await M.debug.read('cs'); let m = 0; for (let c = 0; c < N; c++) m += c2[3 * c]; return m; };
+    // the depth of the sand column: the filled cells in the middle column
+    let nFull = 0; const im = Math.round(rr.nx / 2); for (let k = 0; k < rr.nz; k++) if (cs[3 * (im + rr.nx * k)] > 0) nFull++;
+    const m0 = await mass(), ws = M.debug.grainProps(0.0002).ws, h = nFull * dx, tHalf = h / (2 * ws), dtS = 0.004;
+    await M.debug.steps(Math.round(tHalf / dtS), dtS);
+    const ratio = (await mass()) / m0;
+    check('settling column: half the fine sand has settled out at t = h / (2 ws) (within 5%)', Math.abs(ratio - 0.5) < 0.025, 'remaining ' + (100 * ratio).toFixed(1) + '% at ' + tHalf.toFixed(2) + ' s, fall velocity ' + (ws * 100).toFixed(2) + ' cm/s');
+  }
+  // 18. a steady river: the time-mean suspended profile follows Rouse for the model's own mean u*.
+  //     At 2 cm cells the scheme's own discretization error is 10 to 20% (a 1D replica of the scheme
+  //     shows the same and converges as cells shrink), so the check allows 25%.
+  if (want('rouse')) {
+    const rr = setCls(sandFlume(14, 0.6, dx, () => 0.10), 0);
+    await setup(rr, { type: 'river', h0: 0.40, q: 0.20, hout: 0.30, sediment: true, morfac: 1 });
+    const dtR = stepFor(dx, 1.5), i = Math.round(11 / dx); await M.debug.steps(Math.round(40 / dtR), dtR);
+    const Cm = new Float64Array(rr.nz); let usS = 0, hS = 0, n = 0;
+    for (let t = 0; t < 10; t += 0.25) { await M.debug.steps(Math.round(0.25 / dtR), dtR); const cs = await M.debug.read('cs'), u = await M.debug.read('ust'), e = await M.debug.read('eta'); for (let k = 0; k < rr.nz; k++) Cm[k] += cs[3 * (i + rr.nx * k)]; usS += u[i]; hS += e[i]; n++; }
+    const b = await readBed(), zb = b.zs[i], h = hS / n - zb, P = M.debug.grainProps(0.0002).ws / (0.41 * usS / n);
+    const rz = (k) => (k + 0.5) * dx - zb, kOf = (z) => Math.floor((zb + z) / dx), ka = kOf(0.15 * h), zA = rz(ka), rows = [];
+    let worst = 0;
+    for (const fz of [0.3, 0.5, 0.7]) {
+      const k = kOf(fz * h), zz = rz(k), rouse = Math.pow(((h - zz) / zz) * (zA / (h - zA)), P), model = Cm[k] / Cm[ka];
+      worst = Math.max(worst, Math.abs(model / rouse - 1)); rows.push(fz + 'h ' + model.toFixed(3) + ' vs ' + rouse.toFixed(3));
+    }
+    check('time-mean suspended profile follows Rouse for the model\'s u* (within 25% at 0.3, 0.5, 0.7 of the depth)', isFinite(worst) && Cm[ka] > 0 && worst < 0.25, 'Rouse number ' + P.toFixed(2) + '; ' + rows.join(', '));
+  }
+  // 19. bed plus suspended sediment is conserved in a closed wave flume (bed speed-up 1)
+  if (want('susmass')) {
+    const rr = setCls(sandFlume(12, 0.8, dx, (x) => 0.08 + 0.025 * x), 0);
+    await setup(rr, { type: 'wave', h0: 0.42, H: 0.12, T: 2.0, farEnd: 'wall', absorb: true, sediment: true, morfac: 1 });
+    const N = rr.nx * rr.nz, total = async () => { const b = await readBed(), c2 = await M.debug.read('cs'); let m = 0; for (let c = 0; c < N; c++) m += c2[3 * c] + c2[3 * c + 1] + c2[3 * c + 2]; return { bed: bedVolume(b) * dx * 0.6, sus: m * dx * dx }; };
+    const t0 = await total(); await M.debug.steps(Math.round(30 / stepFor(dx, 1.0)), stepFor(dx, 1.0)); const t1 = await total();
+    const tot0 = t0.bed + t0.sus, tot1 = t1.bed + t1.sus;
+    check('bed plus suspended sediment is conserved in a closed wave flume (within 0.1%)', t1.sus > 0 && Math.abs(tot1 - tot0) / tot0 < 0.001, 'suspended ' + (t1.sus * 1e6).toFixed(1) + ' cm2, total change ' + (100 * (tot1 - tot0) / tot0).toFixed(4) + '%');
+  }
+
+  // 20. armouring: clear water (no sediment supply) over a 50/50 bed of fine sand and gravel, a flow
+  //     that moves sand but not gravel: the degrading bed ends with a surface richer in gravel
+  if (want('armour')) {
+    const rr = sandFlume(10, 0.6, dx, () => 0.12);
+    setCls(rr, 0);                              // painted as one class; every bed cell is set to a 50/50 mix below
+    await setup(rr, { type: 'river', h0: 0.40, q: 0.12, hout: 0.28, sediment: true, morfac: 30, feed: false });
+    // start every bed cell as a true 50/50 mix
+    const N = rr.nx * rr.nz, cell = await M.debug.read('cell');
+    for (let c = 0; c < N; c++) if (rr.mat[c] === 4) { cell[4 * c] = 0.5; cell[4 * c + 1] = 0; cell[4 * c + 2] = 0.5; }
+    M.debug.write('cell', cell);
+    await M.debug.steps(Math.round(20 / stepFor(dx, 1.0)), stepFor(dx, 1.0));
+    const c2 = await M.debug.read('cell'), b = await readBed();
+    let g = 0, n = 0;
+    for (let i = Math.round(0.5 / dx); i < Math.round(3.5 / dx); i++) { const kt = Math.max(0, Math.ceil(b.zs[i] / dx - 0.5) - 1), ct = i + rr.nx * kt, t = c2[4 * ct] + c2[4 * ct + 1] + c2[4 * ct + 2]; if (t > 0) { g += c2[4 * ct + 2] / t; n++; } }
+    const gm = g / n;
+    check('armouring: fine sand leaves a mixed bed and the surface coarsens (gravel above 60%)', n > 50 && gm > 0.6, 'surface gravel fraction ' + (100 * gm).toFixed(1) + '% (started at 50%)');
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

@@ -270,6 +270,17 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('gauges are saved with the scene and come back', /"gauges"/.test(saved) && T.openSceneText(saved) && run('scene.gauges.length') === ng + 2);
   check('a right-click removes a gauge', (T.setTool('gauge'), T.onDown({ offsetX: T.w2s(5, 0.5)[0], offsetY: Yg, button: 2 }), run('scene.gauges.length') === ng + 1));
 
+  // 12. the moving bed: the model's bed is drawn, restart goes back to the design
+  const R2 = T.RASTER, N2 = R2.mat.length, h0 = T.rasterHash();
+  const mat2 = Uint8Array.from(R2.mat); let flipped = -1;
+  for (let c = 0; c < N2; c++) if (mat2[c] === 0) { mat2[c] = 4; flipped = c; break; }
+  const comp2 = new Float32Array(3 * N2); comp2[3 * flipped + 2] = 1; const tdep2 = new Float32Array(N2).fill(-1); tdep2[flipped] = 300;
+  C.api.bedChanged({ mat: mat2, comp: comp2, tdep: tdep2 });
+  check('a bed moved by the model is drawn (cells, mix and deposit time reach the raster)', T.RASTER.mat[flipped] === 4 && T.RASTER.comp[3 * flipped + 2] === 1 && T.RASTER.tdep[flipped] === 300);
+  const sr = C.setRaster, rs2 = C.reset;
+  T.onKey({ key: 'r', target: {}, preventDefault() {} });
+  check('restart goes back to the drawn design and gives the model that bed', T.rasterHash() === h0 && !T.RASTER.comp && C.setRaster === sr + 1 && C.reset === rs2 + 1);
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

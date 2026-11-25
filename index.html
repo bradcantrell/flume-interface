@@ -14,7 +14,7 @@
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
   #app { display: flex; height: 100%; }
   #stage { position: relative; flex: 1; min-width: 0; overflow: hidden; background: radial-gradient(ellipse at 50% 40%, #16202a 0%, #0b0f14 75%); }
-  #stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  #stage > canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
   #ui { touch-action: none; }
   #banner { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); max-width: 640px; padding: 10px 14px; border-radius: 8px;
     background: rgba(40, 24, 18, 0.92); border: 1px solid var(--danger); color: #f3d6cf; z-index: 5; }
@@ -230,7 +230,7 @@ function contains(sh, x, z) {
 function rasterize() {
   const { nx, nz, dx } = GRID, N = nx * nz;
   if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
-  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.cls.fill(0);
+  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.cls.fill(0); R.comp = null; R.tdep = null;
   // the bed: everything under the profile is sediment of the bed's class
   for (let i = 0; i < nx; i++) {
     const zb = bedZ((i + 0.5) * dx), kb = Math.min(nz, Math.round(zb / dx));
@@ -314,6 +314,13 @@ function sceneChanged() {
 
 // ───────── material image (one pixel per cell) ─────────
 let matCanvas = null, matCtx = null, stems = [];
+const BAND_PERIOD = 120;     // seconds of bed time per stratigraphy band
+// the model moved the bed: take its cells, mix and deposit times for drawing (the design stays)
+function bedChanged(b) {
+  if (!RASTER || !b || !b.mat || b.mat.length !== RASTER.mat.length) return;
+  RASTER.mat.set(b.mat); RASTER.comp = b.comp || null; RASTER.tdep = b.tdep || null;
+  buildMatImage(); buildStems();
+}
 function hash2(i, k) { const s = Math.sin(i * 127.1 + k * 311.7) * 43758.5453; return s - Math.floor(s); }
 function buildMatImage() {
   const { nx, nz } = GRID;
@@ -326,9 +333,18 @@ function buildMatImage() {
     let r = 0, g = 0, b = 0, a = 0;
     if (m === MAT.SOLID) { const n = (hash2(i, k) - 0.5) * 10; r = 74 + n; g = 80 + n; b = 89 + n; a = 255; }
     else if (m === MAT.SEDIMENT) {
-      const gr = GRAIN[R.cls[c]] || GRAIN[0], sc = R.cls[c] === 2 ? 3 : R.cls[c] === 1 ? 2 : 1;
-      const n = (hash2(Math.floor(i / sc), Math.floor(k / sc)) - 0.5) * (R.cls[c] === 2 ? 46 : 22) + (hash2(i, k) - 0.5) * 8;
-      r = gr.color[0] + n; g = gr.color[1] + n; b = gr.color[2] + n; a = 255;
+      // the mix of grain classes (from the moving bed) or the painted class; deposits laid down
+      // while running are banded by time, so the bed reads like a cut core
+      let w0 = 0, w1 = 0, w2 = 0;
+      if (R.comp) { w0 = R.comp[3 * c]; w1 = R.comp[3 * c + 1]; w2 = R.comp[3 * c + 2]; }
+      const tw = w0 + w1 + w2; if (tw > 1e-6) { w0 /= tw; w1 /= tw; w2 /= tw; } else { const cl = R.cls[c] | 0; w0 = cl === 0 ? 1 : 0; w1 = cl === 1 ? 1 : 0; w2 = cl === 2 ? 1 : 0; }
+      const coarse = w2 > 0.5 ? 3 : w1 > 0.5 ? 2 : 1;
+      const n = (hash2(Math.floor(i / coarse), Math.floor(k / coarse)) - 0.5) * (8 + 38 * w2 + 14 * w1) + (hash2(i, k) - 0.5) * 8;
+      let sh = 1;
+      if (R.tdep && R.tdep[c] >= 0) sh = (Math.floor(R.tdep[c] / BAND_PERIOD) % 2) ? 0.88 : 1.04;
+      r = (w0 * GRAIN[0].color[0] + w1 * GRAIN[1].color[0] + w2 * GRAIN[2].color[0]) * sh + n;
+      g = (w0 * GRAIN[0].color[1] + w1 * GRAIN[1].color[1] + w2 * GRAIN[2].color[1]) * sh + n;
+      b = (w0 * GRAIN[0].color[2] + w1 * GRAIN[1].color[2] + w2 * GRAIN[2].color[2]) * sh + n; a = 255;
     } else if (m === MAT.POROUS) {
       const cps = Math.max(1, (R.p2[c] || 0.04) / GRID.dx), q = hash2(Math.floor(i / cps), Math.floor(k / cps));
       if (q > (R.p1[c] || 0.4)) { const n = (q - 0.5) * 40 + (hash2(i, k) - 0.5) * 10; r = 128 + n; g = 118 + n; b = 104 + n; a = 240; }
@@ -814,7 +830,13 @@ const HINTS = {
 function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
 
 function setRunning(v) { running = !!v; document.getElementById('run').textContent = running ? 'pause' : 'run'; }
-function restart() { if (model && model.reset) model.reset(); clearGaugeData(); }
+function restart() {
+  // back to the drawn design: the raster from the shapes, the model's bed from it, water from rest
+  rasterize();
+  if (model && model.setRaster) model.setRaster(RASTER);
+  if (model && model.reset) model.reset();
+  buildMatImage(); buildStems(); clearGaugeData();
+}
 let statsAt = 0;
 function updateStats(now) {
   if (now - statsAt < 250) return; statsAt = now;
@@ -930,6 +952,9 @@ function wire() {
 //                                          // negative where a column has no water), at model time t
 //     gaugeWindow() -> seconds,            // optional: window for the gauges' wave height
 //   });
+// A model that moves the bed calls api.bedChanged({ mat, comp, tdep }): mat as the raster, comp the
+// mix of grain classes per cell (3 per cell), tdep the bed time each cell was laid down (< 0: from
+// the start). The interface only draws it; the design (shapes) is unchanged, and restart goes back.
 //
 // The raster: nx x nz cells, index i + nx * k (k = 0 at the floor), cell size dx metres.
 //   mat[c]: 0 water/air, 1 solid, 2 porous, 3 canopy, 4 sediment
@@ -974,7 +999,7 @@ async function boot() {
     if (model.controls.html) document.getElementById('model-controls').innerHTML = model.controls.html;
   }
   const readback = /[?&]readback\b/.test((typeof location !== 'undefined' && location.search) || '');
-  const res = model ? await model.init({ canvas: cvGpu, changed: saveLocal, notify: showNote, readback }) : { ok: false, reason: 'No model is loaded.' };
+  const res = model ? await model.init({ canvas: cvGpu, changed: saveLocal, notify: showNote, readback, bedChanged }) : { ok: false, reason: 'No model is loaded.' };
   if (!res.ok) { const bn = document.getElementById('banner'); bn.textContent = res.reason || 'The model could not start.'; bn.hidden = false; }
   if (model && model.controls && model.controls.wire) model.controls.wire();
   resize();

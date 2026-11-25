@@ -26,7 +26,7 @@ const { CASES, raster } = require('./openfoam_case.js');
   vm.runInThisContext(fs.readFileSync(path.join(__dirname, '..', 'model.js'), 'utf8'), { filename: 'model.js' });
   const res = await M.init({ gpu: create(opts) }); if (!res.ok) { console.log(res.reason); process.exit(1); }
   if (process.env.FLUME_KCG) M.kcg = +process.env.FLUME_KCG;
-  M.setScale('lab'); Object.assign(M.p, C.p); M.setGrid({ nx: r.nx, nz: r.nz, dx }, r); M.reset();
+  M.setScale('lab'); Object.assign(M.p, { sediment: false }, C.p); M.setGrid({ nx: r.nx, nz: r.nz, dx }, r); M.reset();
   const dt = 0.4 * dx / 1.5;
   await M.debug.steps(Math.round((endTime - win) / dt), dt);
   const acc = xs.map(() => (wave ? [1e9, -1e9] : 0)); let n = 0;

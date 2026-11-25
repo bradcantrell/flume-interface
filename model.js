@@ -23,6 +23,14 @@
   const CS_SMAG = 0.17;      // Smagorinsky constant
   const POROUS_ALPHA = 1000, POROUS_BETA = 1.1;     // van Gent (1995) coefficients
   const GRAIN_D = [0.0002, 0.001, 0.01];            // m: fine sand, coarse sand, gravel (as the interface's GRAIN)
+  const SED = { s: 2.65, porosity: 0.4, repose: 32, slope: 1.5 };   // quartz; angle of repose in degrees
+  // critical Shields stress (Soulsby & Whitehouse 1997) and fall velocity (Ferguson & Church 2004)
+  function grainProps(d) {
+    const R = SED.s - 1, Ds = d * Math.cbrt(R * G / (NU_WATER * NU_WATER));
+    const thc = 0.30 / (1 + 1.2 * Ds) + 0.055 * (1 - Math.exp(-0.020 * Ds));
+    const ws = R * G * d * d / (18 * NU_WATER + Math.sqrt(0.75 * 1.0 * R * G * d * d * d));
+    return { thc, ws };
+  }
 
   // ───────────────────────── WGSL ─────────────────────────
   const HEAD = `
@@ -142,7 +150,10 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
 `;
   function K(binds, body, extra = '', wg = 64) {
     let decl = '';
-    binds.forEach(([n, t], j) => { decl += `@group(0) @binding(${j + 1}) var<storage, read_write> ${n}: array<${t === 'u' ? 'u32' : 'f32'}>;\n`; });
+    binds.forEach(([n, t], j) => {
+      if (t === 'U') decl += `@group(0) @binding(${j + 1}) var<uniform> ${n}: array<vec4f, 4>;\nfn spv(i: u32) -> f32 { return ${n}[i / 4u][i % 4u]; }\n`;
+      else decl += `@group(0) @binding(${j + 1}) var<storage, read_write> ${n}: array<${t === 'u' ? 'u32' : 'f32'}>;\n`;
+    });
     return HEAD + decl + extra + `\n@compute @workgroup_size(${wg}) fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(workgroup_id) wid: vec3u) {\n let c = gid.x; _ = prm.nx;\n${body}\n}`;
   }
   const SRC = {
@@ -290,6 +301,202 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
       let i0 = min(u32(fx), prm.nx - 2u); let k0 = min(u32(fz), prm.nz - 1u); let i1 = min(i0 + 1u, prm.nx - 1u);
       let a = w[i0+N*k0]; let b = w[i1+N*k0]; let cc = w[i0+N*(k0+1u)]; let d = w[i1+N*(k0+1u)];
       o[c] = clamp(corr, min(min(a, b), min(cc, d)), max(max(a, b), max(cc, d)));`, SAMPLE + SAMPLE2W + AIR),
+    // ── sediment: the bed is a height zs per column over the erodible zone (zfix .. zcap) ──
+    // sp: 0-2 grain d (m), 3-5 fall velocity (m/s), 6-8 critical Shields, 9 bed speed-up,
+    //     10 porosity, 11 tan(angle of repose), 12 slope factor, 13 on, 14 feed, 15 s-1
+    // per column: bed shear from the log law at the first water cell above the bed, and
+    // Meyer-Peter & Mueller bedload per class, weighted by the mix of the top sediment cell
+    sedShear: K([['u', 'f'], ['f', 'f'], ['solid', 'u'], ['bed', 'f'], ['cell', 'f'], ['qc', 'f'], ['ust', 'f'], ['SP', 'U']], `let i = c; if (i >= prm.nx) {return;}
+      let N = prm.nx; let W = prm.nx + 1u; let dx = prm.dx; let z = bed[3u*(i)];
+      qc[3u*i] = 0.0; qc[3u*i+1u] = 0.0; qc[3u*i+2u] = 0.0; ust[i] = 0.0;
+      if (z < 0.0 || spv(13u) < 0.5) { return; }
+      let k1 = u32(clamp(ceil(z/dx - 0.5), 0.0, f32(prm.nz) - 1.0));
+      let c1 = i + N*k1; if (solid[c1] != 0u || f[c1] < 0.5) { return; }
+      // reference velocity: the first water cell, or the one above it when the first is less than half
+      // a cell above the bed (a cell that has just opened has hardly any velocity yet, and reading it
+      // stalls erosion at every cell boundary)
+      var kr = k1; var y = (f32(k1) + 0.5)*dx - z;
+      if (y < 0.5*dx && k1 + 1u < prm.nz && solid[c1+N] == 0u && f[c1+N] > 0.5) { kr = k1 + 1u; y = y + dx; }
+      y = max(y, 0.3*dx);
+      let uc = 0.5*(u[i+W*kr] + u[i+1u+W*kr]);
+      var fr = vec3f(0.0); let thick = z - bed[3u*(i)+1u];
+      if (k1 > 0u && thick > 1e-6) { let ct = i + N*(k1 - 1u); fr = vec3f(cell[4u*ct], cell[4u*ct+1u], cell[4u*ct+2u]); }
+      let tot = fr.x + fr.y + fr.z; if (tot <= 1e-6) { return; }
+      fr = fr/tot;
+      let dm = fr.x*spv(0u) + fr.y*spv(1u) + fr.z*spv(2u);
+      let ustar = 0.41*abs(uc)/max(log(30.0*y/max(2.5*dm, 1e-5)), 2.0);
+      ust[i] = ustar;
+      let R = spv(15u); let g = prm.g;
+      for (var k = 0u; k < 3u; k++) {
+        let d = spv(k); let th = ustar*ustar/(R*g*d); let ex = max(th - spv(6u+k), 0.0);
+        qc[3u*i+k] = fr[k]*8.0*pow(ex, 1.5)*sqrt(R*g*d*d*d)*sign(uc);
+      }`),
+    // per face between columns: upwind bedload, slope correction, never more than the donor has
+    sedFlux: K([['qc', 'f'], ['bed', 'f'], ['q', 'f'], ['SP', 'U']], `let j = c; if (j > prm.nx) {return;}
+      let dtm = max(spv(9u)*prm.dt, 1e-9); let dx = prm.dx; let por = spv(10u);
+      for (var k = 0u; k < 3u; k++) {
+        var qf = 0.0;
+        if (j == 0u) { if (spv(14u) > 0.5 && bed[3u*(0)] >= 0.0) { qf = max(qc[k], 0.0); } }
+        else if (j == prm.nx) { if (bed[3u*(j-1u)] >= 0.0 && prm.mode < 0.5) { qf = max(qc[3u*(j-1u)+k], 0.0); } }   // a wave flume's far end is closed
+        else {
+          let za = bed[3u*(j-1u)]; let zb = bed[3u*(j)];
+          if (za >= 0.0 && zb >= 0.0) {
+            let a = qc[3u*(j-1u)+k]; let b = qc[3u*j+k];
+            qf = select(b, a, a + b > 0.0);
+            qf = qf*max(1.0 - spv(12u)*sign(qf)*(zb - za)/dx, 0.0);
+            let dn = select(j, j - 1u, qf > 0.0);
+            let avail = max(bed[3u*(dn)] - bed[3u*(dn)+1u], 0.0)*(1.0 - por)*dx/dtm;
+            qf = clamp(qf, -0.5*avail, 0.5*avail);
+          }
+        }
+        q[3u*j+k] = qf;
+      }`),
+    // per column: Exner (bedload divergence plus net deposition from suspension), and the mix of
+    // what is arriving, for new deposits
+    sedExner: K([['q', 'f'], ['bed', 'f'], ['colx', 'f'], ['cell', 'f'], ['SP', 'U']], `let i = c; if (i >= prm.nx) {return;}
+      if (bed[3u*(i)] < 0.0 || spv(13u) < 0.5) { return; }
+      let dtm = spv(9u)*prm.dt; let dx = prm.dx;
+      var dV = 0.0; var inc = vec3f(0.0);
+      for (var k = 0u; k < 3u; k++) {
+        let qa = q[3u*i+k]; let qb = q[3u*(i+1u)+k]; let s2 = colx[6u*i+k];
+        dV += -(qb - qa)/dx + s2;
+        inc[k] = max(qa, 0.0) + max(-qb, 0.0) + max(s2*dx, 0.0);
+      }
+      let dz = clamp(dtm*dV/(1.0 - spv(10u)), -0.2*dx, 0.2*dx);
+      let z0 = bed[3u*(i)];
+      // active layer (Hirano): the top sediment cell's mix changes class by class with what leaves
+      // and arrives, so selective transport sorts the bed (fines leave, gravel stays: armouring)
+      if (z0 - bed[3u*(i)+1u] > 1e-6) {
+        // the top sediment cell: the one under the first water cell (the lowest cell whose centre is at
+        // or above the bed surface; cells below are sediment, as sedCells flips them), as in sedShear
+        let k1 = u32(clamp(ceil(z0/dx - 0.5), 1.0, f32(prm.nz) - 1.0)); let ct = i + prm.nx*(k1 - 1u);
+        var m = vec3f(cell[4u*ct], cell[4u*ct+1u], cell[4u*ct+2u]); let La = dx;
+        for (var k = 0u; k < 3u; k++) {
+          let dzk = dtm*(-(q[3u*(i+1u)+k] - q[3u*i+k])/dx + colx[6u*i+k])/(1.0 - spv(10u));
+          m[k] = max(m[k]*La + dzk, 0.0);
+        }
+        let mt = m.x + m.y + m.z;
+        if (mt > 1e-9) { cell[4u*ct] = m.x/mt; cell[4u*ct+1u] = m.y/mt; cell[4u*ct+2u] = m.z/mt; }
+      }
+      bed[3u*(i)] = clamp(z0 + dz, bed[3u*(i)+1u], max(bed[3u*(i)+2u] - 0.01*dx, bed[3u*(i)+1u]));
+      let t = inc.x + inc.y + inc.z;
+      if (t > 1e-12) { colx[6u*i+3u] = inc.x/t; colx[6u*i+4u] = inc.y/t; colx[6u*i+5u] = inc.z/t; }`),
+    // slumping: where two columns differ by more than the angle of repose, move half the excess
+    // (red-black over faces, so no column is touched twice in one pass)
+    sedAval: K([['bed', 'f'], ['SP', 'U']], `let j = 2u*c + PAR + 1u; if (j >= prm.nx) {return;}
+      if (spv(13u) < 0.5) { return; }
+      let a = j - 1u; let b = j; let za = bed[3u*(a)]; let zb = bed[3u*(b)]; if (za < 0.0 || zb < 0.0) { return; }
+      let d = za - zb; let mx = spv(11u)*prm.dx; if (abs(d) <= mx) { return; }
+      var mv = 0.5*(abs(d) - mx);
+      if (d > 0.0) { mv = min(mv, min(za - bed[3u*(a)+1u], bed[3u*(b)+2u] - 0.01*prm.dx - zb)); mv = max(mv, 0.0); bed[3u*(a)] = za - mv; bed[3u*(b)] = zb + mv; }
+      else { mv = min(mv, min(zb - bed[3u*(b)+1u], bed[3u*(a)+2u] - 0.01*prm.dx - za)); mv = max(mv, 0.0); bed[3u*(b)] = zb - mv; bed[3u*(a)] = za + mv; }`, 'override PAR: u32;\n'),
+    // cells follow the bed: water <-> sediment inside the erodible zone; new sediment records its
+    // mix, the time it was laid down, and its roughness; water it displaces moves up a cell
+    sedCells: K([['solid', 'u'], ['f', 'f'], ['bed', 'f'], ['cell', 'f'], ['colx', 'f'], ['tb', 'f'], ['ks', 'f'], ['cs', 'f'], ['SP', 'U']], `if (c >= prm.nx*prm.nz) {return;}
+      if (spv(13u) < 0.5) { return; }
+      let N = prm.nx; let i = c % N; let k = c / N; let z = bed[3u*(i)]; if (z < 0.0) { return; }
+      let zc = (f32(k) + 0.5)*prm.dx;
+      if (zc <= bed[3u*(i)+1u] || zc >= bed[3u*(i)+2u]) { return; }
+      let want = zc < z; let isS = solid[c] != 0u;
+      if (want && !isS) {
+        solid[c] = 1u;
+        if (k + 1u < prm.nz) { f[c+N] = min(1.0, f[c+N] + f[c]); }
+        f[c] = 0.0;
+        // a new cell continues the active layer under it (which already took in what arrived);
+        // only on a bare floor does it take the arriving mix
+        var m = vec3f(colx[6u*i+3u], colx[6u*i+4u], colx[6u*i+5u]);
+        if (k > 0u && solid[c-N] != 0u) {
+          let mb = vec3f(cell[4u*(c-N)], cell[4u*(c-N)+1u], cell[4u*(c-N)+2u]); let tb2 = mb.x + mb.y + mb.z;
+          if (tb2 > 1e-6) { m = mb/tb2; }
+        }
+        cell[4u*c] = m.x; cell[4u*c+1u] = m.y; cell[4u*c+2u] = m.z; cell[4u*c+3u] = tb[0]*spv(9u);
+        ks[c] = 2.5*(m.x*spv(0u) + m.y*spv(1u) + m.z*spv(2u));
+        cs[3u*c] = 0.0; cs[3u*c+1u] = 0.0; cs[3u*c+2u] = 0.0;
+      } else if (!want && isS) {
+        // the half cell of sediment left under the surface merges into the new top cell below
+        if (k > 0u && solid[c-N] != 0u) {
+          let ma = vec3f(cell[4u*c], cell[4u*c+1u], cell[4u*c+2u]); let mb = vec3f(cell[4u*(c-N)], cell[4u*(c-N)+1u], cell[4u*(c-N)+2u]);
+          let ta = ma.x + ma.y + ma.z; let tbb = mb.x + mb.y + mb.z;
+          if (ta > 1e-6 && tbb > 1e-6) { let mm2 = (ma/ta + 2.0*mb/tbb)/3.0; cell[4u*(c-N)] = mm2.x; cell[4u*(c-N)+1u] = mm2.y; cell[4u*(c-N)+2u] = mm2.z; }
+        }
+        solid[c] = 0u;
+        f[c] = select(0.0, 1.0, k + 1u < prm.nz && f[min(c + N, prm.nx*prm.nz - 1u)] > 0.5);
+        cs[3u*c] = 0.0; cs[3u*c+1u] = 0.0; cs[3u*c+2u] = 0.0;
+      }`),
+    // suspended load per class: carried by the flow, settling at the fall velocity, mixed by
+    // K = kappa u* z' (1 - z'/h) + nu (z' above the bed, h the local depth: the classic
+    // parabolic profile behind the Rouse equation). First-order upwind, conservative; nothing
+    // crosses into air, solids or the bed (the bed exchange is susBed). Clear water comes in.
+    susAdv: K([['u', 'f'], ['w', 'f'], ['typ', 'u'], ['cs', 'f'], ['co', 'f'], ['ust', 'f'], ['bed', 'f'], ['eta', 'f'], ['SP', 'U']], `if (c >= prm.nx*prm.nz) {return;}
+      let N = prm.nx; let W = prm.nx + 1u; let i = c % N; let k = c / N; let dx = prm.dx;
+      if (typ[c] != 1u || spv(13u) < 0.5) { co[3u*c] = cs[3u*c]; co[3u*c+1u] = cs[3u*c+1u]; co[3u*c+2u] = cs[3u*c+2u]; return; }
+      let zb = max(bed[3u*i], 0.0); let h = max(eta[i] - zb, dx); let us = ust[i];
+      for (var q = 0u; q < 3u; q++) {
+        let ws = spv(3u + q); let C = cs[3u*c+q];
+        // second-order upwind with a minmod limiter (first order next to walls, air and the bed)
+        var fe = 0.0;
+        if (i + 1u < N) { let cn = c + 1u; if (typ[cn] == 1u) { let ue = u[i+1u+W*k];
+          let ce = select(face(cv(i32(i)+2, i32(k), q, cs[3u*cn+q]), cs[3u*cn+q], C), face(cv(i32(i)-1, i32(k), q, C), C, cs[3u*cn+q]), ue > 0.0);
+          fe = ue*ce - kmix(k, us, zb, h)*(cs[3u*cn+q] - C)/dx; } }
+        else if (prm.mode < 0.5) { fe = max(u[i+1u+W*k], 0.0)*C; }
+        var fw = 0.0;
+        if (i > 0u) { let cn = c - 1u; if (typ[cn] == 1u) { let uw = u[i+W*k];
+          let cw = select(face(cv(i32(i)+1, i32(k), q, C), C, cs[3u*cn+q]), face(cv(i32(i)-2, i32(k), q, cs[3u*cn+q]), cs[3u*cn+q], C), uw > 0.0);
+          fw = uw*cw - kmix(k, us, zb, h)*(C - cs[3u*cn+q])/dx; } }
+        else { fw = min(u[i+W*k], 0.0)*C; }             // clear water in; outflow at the inlet carries C
+        var fN = 0.0;
+        if (k + 1u < prm.nz) { let cn = c + N; if (typ[cn] == 1u) { let wn = w[i+N*(k+1u)] - ws;
+          let cnf = select(face(cv(i32(i), i32(k)+2, q, cs[3u*cn+q]), cs[3u*cn+q], C), face(cv(i32(i), i32(k)-1, q, C), C, cs[3u*cn+q]), wn > 0.0);
+          fN = wn*cnf - kmixz(k + 1u, us, zb, h)*(cs[3u*cn+q] - C)/dx; } }
+        var fs = 0.0;
+        if (k > 0u) { let cn = c - N; if (typ[cn] == 1u) { let wsf = w[i+N*k] - ws;
+          let csf = select(face(cv(i32(i), i32(k)+1, q, C), C, cs[3u*cn+q]), face(cv(i32(i), i32(k)-2, q, cs[3u*cn+q]), cs[3u*cn+q], C), wsf > 0.0);
+          fs = wsf*csf - kmixz(k, us, zb, h)*(C - cs[3u*cn+q])/dx; } }
+        co[3u*c+q] = max(C - prm.dt/dx*(fe - fw + fN - fs), 0.0);
+      }`, MM + `fn kmix(k:u32, us:f32, zb:f32, h:f32) -> f32 { let z = clamp((f32(k) + 0.5)*prm.dx - zb, 0.0, h); return 0.41*us*z*(1.0 - z/h) + 1e-6; }
+fn kmixz(k:u32, us:f32, zb:f32, h:f32) -> f32 { let z = clamp(f32(k)*prm.dx - zb, 0.0, h); return 0.41*us*z*(1.0 - z/h) + 1e-6; }
+// the concentration in cell (i, k), or the fallback where that cell is not water (zero gradient)
+fn cv(i:i32, k:i32, q:u32, fb:f32) -> f32 { if (i < 0 || k < 0 || i >= i32(prm.nx) || k >= i32(prm.nz)) { return fb; } let c = u32(i) + prm.nx*u32(k); if (typ[c] != 1u) { return fb; } return cs[3u*c+q]; }
+// limited face value from the cell upstream of the donor, the donor, and the receiver
+// (van Leer limiter: minmod, which always takes the smaller slope, flattened the Rouse profile
+// by about 18% in its exponent; van Leer's harmonic mean is less biased on smooth profiles)
+fn vl(a:f32, b:f32) -> f32 { if (a*b <= 0.0) { return 0.0; } return 2.0*a*b/(a + b); }
+fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu); }
+`),
+    // bed exchange per column: pickup E = ws c_a (van Rijn 1984 reference concentration, only
+    // where u* > ws), settling D = ws C at the first water cell; the net (D - E) goes to Exner
+    susBed: K([['f', 'f'], ['solid', 'u'], ['bed', 'f'], ['cell', 'f'], ['cs', 'f'], ['colx', 'f'], ['ust', 'f'], ['ustK', 'f'], ['SP', 'U']], `let i = c; if (i >= prm.nx) {return;}
+      colx[6u*i] = 0.0; colx[6u*i+1u] = 0.0; colx[6u*i+2u] = 0.0;
+      let z = bed[3u*i]; if (z < 0.0 || spv(13u) < 0.5) { ustK[i] = 0.0; return; }
+      let N = prm.nx; let dx = prm.dx;
+      let k1 = u32(clamp(ceil(z/dx - 0.5), 0.0, f32(prm.nz) - 1.0)); let c1 = i + N*k1;
+      if (solid[c1] != 0u || f[c1] < 0.5) { ustK[i] = 0.0; return; }
+      // mixing in the water column follows a smoothed u*, relaxed over one eddy turnover (h / u*,
+      // kept between 1 and 30 s): depth-scale mixing does not follow every flicker of the bed shear,
+      // and a profile that switches with it averages flatter than Rouse
+      var kt = k1; while (kt + 1u < prm.nz && solid[i + N*(kt + 1u)] == 0u && f[i + N*(kt + 1u)] > 0.5) { kt++; }
+      let hl = max(f32(kt + 1u)*dx - z, dx);
+      let tau = clamp(hl/max(ustK[i], 1e-3), 1.0, 30.0);
+      ustK[i] = ustK[i] + (ust[i] - ustK[i])*min(prm.dt/tau, 1.0);
+      var fr = vec3f(0.0);
+      if (k1 > 0u && z - bed[3u*i+1u] > 1e-6) { let ct = c1 - N; fr = vec3f(cell[4u*ct], cell[4u*ct+1u], cell[4u*ct+2u]); }
+      let tot = fr.x + fr.y + fr.z; if (tot > 1e-6) { fr = fr/tot; }
+      let us = ust[i]; let a = max((f32(k1) + 0.5)*dx - z, 0.3*dx); let R = spv(15u);
+      for (var q = 0u; q < 3u; q++) {
+        let d = spv(q); let ws = spv(3u + q); let thc = spv(6u + q);
+        var E = 0.0;
+        if (us > ws && tot > 1e-6) {
+          let th = us*us/(R*prm.g*d); let T = max(th/thc - 1.0, 0.0);
+          let Ds = d*pow(R*prm.g/1e-12, 1.0/3.0);
+          let ca = min(0.015*d*pow(T, 1.5)/(a*pow(Ds, 0.3)), 0.05);
+          E = fr[q]*ws*ca;
+        }
+        let Cb = cs[3u*c1+q]; var D = ws*Cb;
+        // a cell cannot drop more than it holds, or pick up more than the bed can give
+        D = min(D, Cb*dx/prm.dt);
+        cs[3u*c1+q] = max(Cb + prm.dt*(E - D)/dx, 0.0);
+        colx[6u*i+q] = D - E;
+      }`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -558,8 +765,8 @@ fn smp(i:i32, k:i32) -> f32 {
 
   // ───────────────────────── model ─────────────────────────
   const DEFAULTS = {
-    lab:   { type: 'river', h0: 0.40, q: 0.10, hout: 0.40, H: 0.08, T: 2.0, speed: 1, farEnd: 'beach', absorb: true },
-    field: { type: 'river', h0: 6.0, q: 6.0, hout: 6.0, H: 1.5, T: 8.0, speed: 1, farEnd: 'beach', absorb: true },
+    lab:   { type: 'river', h0: 0.40, q: 0.10, hout: 0.40, H: 0.08, T: 2.0, speed: 1, farEnd: 'beach', absorb: true, sediment: true, morfac: 10, feed: true },
+    field: { type: 'river', h0: 6.0, q: 6.0, hout: 6.0, H: 1.5, T: 8.0, speed: 1, farEnd: 'beach', absorb: true, sediment: true, morfac: 10, feed: true },
   };
 
   const M = {
@@ -585,6 +792,9 @@ fn smp(i:i32, k:i32) -> f32 {
       <div class="row m-wave"><label for="m-wt">wave period (s)</label><input id="m-wt" type="number" step="0.1" min="0.3"></div>
       <div class="row m-wave"><label for="m-far">far end</label><select id="m-far"><option value="beach">absorbing</option><option value="wall">wall (reflects)</option></select></div>
       <div class="row m-wave"><label for="m-abs">paddle absorbs</label><select id="m-abs"><option value="1">yes</option><option value="0">no</option></select></div>
+      <div class="row"><label for="m-sed">moving bed</label><select id="m-sed"><option value="1">on</option><option value="0">off</option></select></div>
+      <div class="row m-river"><label for="m-feed">sediment supply</label><select id="m-feed"><option value="1">equilibrium</option><option value="0">none (clear water)</option></select></div>
+      <div class="row"><label for="m-mf">bed speed-up</label><input id="m-mf" type="number" min="1" max="200" step="1" title="the bed changes this many times faster than the water (morphological factor)"></div>
       <div class="row"><label for="m-color">water colour</label>
         <select id="m-color"><option value="0">depth</option><option value="1">speed</option></select></div>`,
     wire() {
@@ -596,6 +806,9 @@ fn smp(i:i32, k:i32) -> f32 {
       });
       $('m-type').addEventListener('change', (e) => { M.p.type = e.target.value; M.syncControls(); M.applyParams(); M.reset(); M.api && M.api.changed(); });
       $('m-color').addEventListener('change', (e) => { M.colorMode = +e.target.value; });
+      $('m-sed').addEventListener('change', (e) => { M.p.sediment = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
+      $('m-feed').addEventListener('change', (e) => { M.p.feed = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
+      $('m-mf').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v >= 1) M.p.morfac = Math.min(v, 200); M.syncControls(); M.applyParams(); M.api && M.api.changed(); });
       $('m-far').addEventListener('change', (e) => { M.p.farEnd = e.target.value; M.applyParams(); M.api && M.api.changed(); });
       $('m-abs').addEventListener('change', (e) => { M.p.absorb = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
       M.syncControls();
@@ -606,6 +819,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const $ = (id) => document.getElementById(id), p = M.p;
     const set = (id, v) => { const el = $(id); if (el) el.value = String(+v.toFixed(4)); };
     if (!$('m-type')) return;
+    $('m-sed').value = p.sediment === false ? '0' : '1'; $('m-feed').value = p.feed === false ? '0' : '1'; set('m-mf', p.morfac || 10);
     $('m-type').value = p.type; $('m-far').value = p.farEnd === 'wall' ? 'wall' : 'beach'; $('m-abs').value = p.absorb === false ? '0' : '1'; set('m-h0', p.h0); set('m-q', p.q); set('m-hout', p.hout); set('m-wh', p.H); set('m-wt', p.T);
     for (const el of document.querySelectorAll('.m-river')) el.style.display = p.type === 'river' ? '' : 'none';
     for (const el of document.querySelectorAll('.m-wave')) el.style.display = p.type === 'wave' ? '' : 'none';
@@ -618,13 +832,13 @@ fn smp(i:i32, k:i32) -> f32 {
       if (s[k] == null) continue;
       if (k === 'type') { if (s[k] === 'river' || s[k] === 'wave') M.p.type = s[k]; }
       else if (k === 'farEnd') M.p.farEnd = s[k] === 'wall' ? 'wall' : 'beach';
-      else if (k === 'absorb') M.p.absorb = !!s[k];
+      else if (k === 'absorb' || k === 'sediment' || k === 'feed') M.p[k] = !!s[k];
       else if (isFinite(+s[k])) M.p[k] = +s[k];
     }
     if (s.colorMode != null) M.colorMode = +s.colorMode;
     M.syncControls(); if (M.grid) M.applyParams();
   };
-  M.setScale = function (scale) { M.scale = scale; M.p = Object.assign({}, DEFAULTS[scale] || DEFAULTS.lab, { type: M.p.type, farEnd: M.p.farEnd, absorb: M.p.absorb }); M.syncControls(); if (M.grid) M.applyParams(); };
+  M.setScale = function (scale) { M.scale = scale; M.p = Object.assign({}, DEFAULTS[scale] || DEFAULTS.lab, { type: M.p.type, farEnd: M.p.farEnd, absorb: M.p.absorb, sediment: M.p.sediment, morfac: M.p.morfac, feed: M.p.feed }); M.syncControls(); if (M.grid) M.applyParams(); };
 
   M.init = async function (api) {
     M.api = api || null;
@@ -699,9 +913,11 @@ fn smp(i:i32, k:i32) -> f32 {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
+    const SPU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
     while (L[L.length - 1].nx > 8 && L[L.length - 1].nz > 4) {
       const f = L[L.length - 1], cnx = Math.ceil(f.nx / 2), cnz = Math.ceil(f.nz / 2), n = cnx * cnz;
@@ -734,6 +950,14 @@ fn smp(i:i32, k:i32) -> f32 {
       exWab: D('extrapW', P0, [B.w, B.wvA, B.w2, B.wvB], NW), exWba: D('extrapW', P0, [B.w2, B.wvB, B.w, B.wvA], NW),
       advU: D('advectU', P0, [B.u, B.w, B.u2], NU), advW: D('advectW', P0, [B.u, B.w, B.w2], NW),
       advFU: D('advFU', P0, [B.u, B.w, B.u2, B.typ], NU), advFW: D('advFW', P0, [B.u, B.w, B.w2, B.typ], NW),
+      sedShear: D('sedShear', P0, [B.u, B.f, B.solid, B.bed, B.cell, B.qc, B.ust, SPU], nx),
+      sedFlux: D('sedFlux', P0, [B.qc, B.bed, B.qb, SPU], nx + 1),
+      sedExner: D('sedExner', P0, [B.qb, B.bed, B.colx, B.cell, SPU], nx),
+      sedAvalR: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 0 }),
+      sedAvalB: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 1 }),
+      susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
+      susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
+      sedCells: D('sedCells', P0, [B.solid, B.f, B.bed, B.cell, B.colx, B.tb, B.ks, B.cs, SPU], N),
       macU: D('macU', P0, [B.u, B.w, B.u2, B.uM, B.typ], NU), macW: D('macW', P0, [B.u, B.w, B.w2, B.wM, B.typ], NW),
       bcU: D('bcU', P0, [B.u, B.solid, B.tb, B.eta], NU), bcW: D('bcW', P0, [B.w, B.solid], NW),
       spongeU: D('spongeU', P0, [B.u], NU), spongeW: D('spongeW', P0, [B.w], NW),
@@ -755,7 +979,7 @@ fn smp(i:i32, k:i32) -> f32 {
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, N, NU, NW, all: all.concat([P0], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, N, NU, NW, all: all.concat([P0, SPU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -785,6 +1009,20 @@ fn smp(i:i32, k:i32) -> f32 {
       else if (m[c] === 1) ks[c] = ksSolid;
     }
     if (M.wallFriction === false) ks.fill(0);       // for tests: walls and bed without friction
+    // the erodible bed per column: the sediment under the lowest water cell, down to the top of any
+    // fixed solid (zfix), up to the next solid above (zcap)
+    const { nx, nz, dx } = M.grid, zs = new Float32Array(nx), zfix = new Float32Array(nx), zcap = new Float32Array(nx);
+    const comp = new Float32Array(3 * N), tdep = new Float32Array(N).fill(-1);
+    for (let c = 0; c < N; c++) if (m[c] === 4) comp[3 * c + Math.min(2, raster.cls[c] | 0)] = 1;
+    for (let i = 0; i < nx; i++) {
+      let kf = 0; while (kf < nz && (m[i + nx * kf] === 1 || m[i + nx * kf] === 4)) kf++;
+      if (kf >= nz) { zs[i] = zfix[i] = -1; zcap[i] = -1; continue; }
+      let kx = kf; while (kx > 0 && m[i + nx * (kx - 1)] === 4) kx--;
+      let ku = kf; while (ku < nz && m[i + nx * ku] !== 1 && m[i + nx * ku] !== 4) ku++;
+      zs[i] = kf * dx; zfix[i] = kx * dx; zcap[i] = ku * dx;
+    }
+    M.bed0 = { solid: solid.slice(), ks: ks.slice(), comp, tdep, zs, zfix, zcap, mat: m.slice() };
+    writeBed();
     M.device.queue.writeBuffer(M.S.B.dgX, 0, dgX); M.device.queue.writeBuffer(M.S.B.dgZ, 0, dgZ); M.device.queue.writeBuffer(M.S.B.ks, 0, ks);
     M.applyParams();
   };
@@ -793,6 +1031,16 @@ fn smp(i:i32, k:i32) -> f32 {
   function bedAt(i) {
     const g = M.grid, s = M.solidHost; if (!s) return 0;
     let k = 0; while (k < g.nz && s[i + g.nx * k]) k++; return k * g.dx;
+  }
+  // (re)write the starting bed: solids, roughness, mix, deposit times, bed heights
+  function writeBed() {
+    const b = M.bed0, q = M.device.queue, B = M.S.B; if (!b) return;
+    const nx = M.grid.nx, N = b.solid.length, bed = new Float32Array(3 * nx), cell = new Float32Array(4 * N), colx = new Float32Array(6 * nx);
+    for (let i = 0; i < nx; i++) { bed[3 * i] = b.zs[i]; bed[3 * i + 1] = b.zfix[i]; bed[3 * i + 2] = b.zcap[i]; colx[6 * i + 3] = colx[6 * i + 4] = colx[6 * i + 5] = 1 / 3; }
+    for (let c = 0; c < N; c++) { cell[4 * c] = b.comp[3 * c]; cell[4 * c + 1] = b.comp[3 * c + 1]; cell[4 * c + 2] = b.comp[3 * c + 2]; cell[4 * c + 3] = b.tdep[c]; }
+    q.writeBuffer(B.solid, 0, b.solid); q.writeBuffer(B.ks, 0, b.ks); q.writeBuffer(B.bed, 0, bed); q.writeBuffer(B.cell, 0, cell); q.writeBuffer(B.colx, 0, colx);
+    q.writeBuffer(B.cs, 0, new Float32Array(3 * N));
+    M.solidHost = b.solid; M.zsHost = b.zs.slice(); M.bedRange = [0, 0];
   }
   M.applyParams = function () {
     if (!M.grid) return;
@@ -811,7 +1059,14 @@ fn smp(i:i32, k:i32) -> f32 {
       zin: zIn, zout: zOut, q: river ? p.q : 0, nu: NU_WATER, cs: M.turbulence === false ? 0 : CS_SMAG,
       amp: river ? 0 : 0.5 * (p.H || 0), absorb: !river && p.absorb !== false && p.absorb !== 0 ? 1 : 0 };
     M.P = P;
-    if (M.ok && M.S) writeP(M.S.P0, P);
+    if (M.ok && M.S) {
+      writeP(M.S.P0, P);
+      const sp = new Float32Array(16), gp = GRAIN_D.map(grainProps);
+      for (let k = 0; k < 3; k++) { sp[k] = GRAIN_D[k]; sp[3 + k] = gp[k].ws; sp[6 + k] = gp[k].thc; }
+      sp[9] = p.morfac || 10; sp[10] = SED.porosity; sp[11] = Math.tan(SED.repose * Math.PI / 180); sp[12] = SED.slope;
+      sp[13] = p.sediment ? 1 : 0; sp[14] = river && p.feed !== false ? 1 : 0; sp[15] = SED.s - 1;   // supply: a river brings in what it carries (zero gradient) unless clear water is chosen; a paddle brings none
+      M.device.queue.writeBuffer(M.S.SPU, 0, sp);
+    }
   };
 
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
@@ -821,6 +1076,7 @@ fn smp(i:i32, k:i32) -> f32 {
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
     const h0 = M.p.h0;
     for (let k = 0; k < nz; k++) { const fr = Math.min(Math.max((h0 - k * dx) / dx, 0), 1); if (fr <= 0) break; for (let i = 0; i < nx; i++) f[i + nx * k] = sol[i + nx * k] ? 0 : fr; }
+    writeBed();
     const B = M.S.B, q = M.device.queue;
     q.writeBuffer(B.f, 0, f); q.writeBuffer(B.u, 0, new Float32Array(M.S.NU)); q.writeBuffer(B.w, 0, new Float32Array(M.S.NW)); q.writeBuffer(B.tb, 0, new Float32Array(4));
     let v = 0; for (let c = 0; c < N; c++) v += f[c]; M.vol0 = v * dx * dx; M.vol = M.vol0; M.vmax = 0;
@@ -877,6 +1133,13 @@ fn smp(i:i32, k:i32) -> f32 {
     if (n & 1) { run(pass, d.fluxX); run(pass, d.updX); run(pass, d.fluxZ); run(pass, d.updZ); }
     else { run(pass, d.fluxZ); run(pass, d.updZ); run(pass, d.fluxX); run(pass, d.updX); }
     run(pass, d.tick);
+    if (M.p.sediment) {
+      run(pass, d.surface); run(pass, d.classify); run(pass, d.sedShear); run(pass, d.susAdv);
+      pass.end(); enc.copyBufferToBuffer(B.cs2, 0, B.cs, 0, M.S.N * 12); pass = enc.beginComputePass();
+      run(pass, d.susBed); run(pass, d.sedFlux); run(pass, d.sedExner);
+      for (let a = 0; a < 4; a++) { run(pass, d.sedAvalR); run(pass, d.sedAvalB); }
+      run(pass, d.sedCells);
+    }
     pass.end();
   }
   function encodeDiag(enc) {
@@ -914,7 +1177,30 @@ fn smp(i:i32, k:i32) -> f32 {
     }
     if (M.frameNo % 6 === 0 && !M.readBusy) readScalars();
     if (M.watching && M.frameNo % 2 === 0 && !M.etaBusy) readSurface();
+    if (M.p.sediment && running && M.frameNo % 30 === 0 && !M.bedBusy) readBed();
   };
+  // the moving bed, for drawing: which cells are sediment, their mix and deposit time
+  function readBed() {
+    if (!M.S || !M.bed0) return;
+    M.bedBusy = true;
+    const B = M.S.B, names = ['solid', 'cell', 'bed'], st = {}, e = M.device.createCommandEncoder();
+    for (const n of names) { st[n] = M.device.createBuffer({ size: B[n].size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }); e.copyBufferToBuffer(B[n], 0, st[n], 0, B[n].size); }
+    M.device.queue.submit([e.finish()]);
+    Promise.all(names.map(n => st[n].mapAsync(GPUMapMode.READ))).then(() => {
+      const N = M.grid.nx * M.grid.nz, solid = new Uint32Array(st.solid.getMappedRange().slice(0, N * 4));
+      const cell = new Float32Array(st.cell.getMappedRange().slice(0, 4 * N * 4)), bed = new Float32Array(st.bed.getMappedRange().slice(0, 3 * M.grid.nx * 4));
+      const comp = new Float32Array(3 * N), tdep = new Float32Array(N), zs = new Float32Array(M.grid.nx);
+      for (let c = 0; c < N; c++) { comp[3 * c] = cell[4 * c]; comp[3 * c + 1] = cell[4 * c + 1]; comp[3 * c + 2] = cell[4 * c + 2]; tdep[c] = cell[4 * c + 3]; }
+      for (let i = 0; i < zs.length; i++) zs[i] = bed[3 * i];
+      for (const n of names) { st[n].unmap(); st[n].destroy(); }
+      const m0 = M.bed0.mat, mat = new Uint8Array(N);
+      for (let c = 0; c < N; c++) mat[c] = m0[c] === 1 ? 1 : solid[c] ? 4 : (m0[c] === 4 ? 0 : m0[c]);
+      let lo = 0, hi = 0; for (let i = 0; i < zs.length; i++) if (M.bed0.zs[i] >= 0) { const d = zs[i] - M.bed0.zs[i]; lo = Math.min(lo, d); hi = Math.max(hi, d); }
+      M.zsHost = zs; M.bedRange = [lo, hi];
+      if (M.api && M.api.bedChanged) M.api.bedChanged({ mat, comp, tdep });
+      M.bedBusy = false;
+    }, () => { M.bedBusy = false; });
+  }
   // gauges: the surface height per column, read back every other frame while gauges exist
   M.watchSurface = function (on) { M.watching = !!on; };
   M.surfaceSample = function () { return M.etaHost || null; };
@@ -1000,6 +1286,7 @@ fn smp(i:i32, k:i32) -> f32 {
       ['speed', (M.msStep > 0 ? Math.min(M.stepsFrame * M.dt / Math.max(M.stepsFrame * M.msStep / 1000, 1 / 60), 99) : 0).toFixed(2) + ' × real time'],
       ['water volume', (M.vol0 > 0 ? (100 * M.vol / M.vol0).toFixed(1) : '100') + ' % of start'],
     ];
+    if (M.p.sediment) out.push(['bed', 'time ' + (M.t * (M.p.morfac || 10)).toFixed(0) + ' s, change ' + (M.bedRange[0] * 100).toFixed(1) + ' / +' + (M.bedRange[1] * 100).toFixed(1) + ' cm']);
     if (M.p.type === 'wave' && M.wave.L) out.push(['wavelength', M.wave.L.toFixed(2) + ' m (stroke ' + (M.wave.S * 100).toFixed(1) + ' cm)']);
     return out;
   };
@@ -1016,6 +1303,7 @@ fn smp(i:i32, k:i32) -> f32 {
       }
       await M.device.queue.onSubmittedWorkDone();
     },
+    write(name, data) { M.device.queue.writeBuffer(M.S.B[name], 0, data); },
     async read(name) {
       const B = M.S.B[name], n = B.size / 4;
       const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
@@ -1035,7 +1323,7 @@ fn smp(i:i32, k:i32) -> f32 {
       M.ctx = save; M.render_ = null; tex.destroy();
       return err ? err.message : null;
     },
-    waveNumber, pistonStroke, SRC, RENDER,
+    waveNumber, pistonStroke, SRC, RENDER, grainProps, SED, GRAIN_D,
   };
 
   registerModel(M);

@@ -29,6 +29,7 @@ const scale = +(process.env.DPR || 1);
       curMat = 1; addShape('poly', [[10.2, 0.2], [10.9, 0.2], [10.75, 0.42], [10.35, 0.42]]);
       curMat = 3; addShape('rect', [[14.2, 0.3], [16.4, 0.62]]);
       curMat = 4; curProps[4].cls = 2; addShape('stroke', [[11.6, 0.29], [13.6, 0.42]], 0.05);
+      scene.gauges = [{ id: 1, x: 3.0 }, { id: 2, x: 12.5 }]; nextGaugeId = 3;
       model.reset(); setRunning(true);
     });
     await page.waitForTimeout(secs * 1000);

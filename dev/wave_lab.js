@@ -37,7 +37,7 @@ async function measure(M, o) {
   const nx = Math.round(L / dx), nz = Math.round(Hd / dx), N = nx * nz;
   const r = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
   if (paint) for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { const m = paint((i + .5) * dx, (k + .5) * dx); if (m) r.mat[i + nx * k] = m; }
-  M.setScale('lab'); Object.assign(M.p, { type: 'wave', h0: h, H, T }); M.setGrid({ nx, nz, dx }, r); M.reset();
+  M.setScale('lab'); Object.assign(M.p, { sediment: false, type: 'wave', h0: h, H, T }); M.setGrid({ nx, nz, dx }, r); M.reset();
   const wl = M.debug.pistonStroke(H, T, h), k = 2 * Math.PI / wl.L, om = 2 * Math.PI / T;
   const sx0 = M.P.sx0;
   // gauges: a pair one quarter wavelength apart for the phase speed, three for the reflection split
@@ -91,7 +91,7 @@ if (require.main === module) (async () => {
     const xs = [6, 6 + 0.22 * wl.L, 6 + 0.5 * wl.L], dt = 0.4 * dx / 1.0;
     for (const absorb of [false, true]) {
       const r = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
-      M.setScale('lab'); Object.assign(M.p, { type: 'wave', h0: h, H, T, farEnd: 'wall', absorb }); M.setGrid({ nx, nz, dx }, r); M.reset();
+      M.setScale('lab'); Object.assign(M.p, { sediment: false, type: 'wave', h0: h, H, T, farEnd: 'wall', absorb }); M.setGrid({ nx, nz, dx }, r); M.reset();
       const out = [];
       for (const until of [20, 40, 60]) {
         await M.debug.steps(Math.round((until - 6 * T - M.t) / dt), dt);
