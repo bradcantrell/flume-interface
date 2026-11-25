@@ -352,6 +352,29 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('armouring: fine sand leaves a mixed bed and the surface coarsens (gravel above 60%)', n > 50 && gm > 0.6, 'surface gravel fraction ' + (100 * gm).toFixed(1) + '% (started at 50%)');
   }
 
+  // 21. flexible plants: the GPU's reconfiguration is Luhar & Nepf for its own canopy velocity, and a
+  //     flexible meadow resists less than the same meadow rigid
+  if (want('plantflex')) {
+    const zb = 0.02, q = 0.06, a = 20, cd = 1.0, Lp = 2, stem = 0.006, drops = {};
+    let rGPU = 0, rLN = 0, Ucan = 0;
+    for (const EI of [1e6, 2e-5]) {
+      const rr = flume(8, 0.5, dx, (x, z) => (z < zb ? 4 : (x > 3 && x < 3 + Lp && z < 0.22) ? 3 : 0));
+      for (let c = 0; c < rr.mat.length; c++) if (rr.mat[c] === 3) { rr.p1[c] = a; rr.p2[c] = cd; rr.p3[c] = stem; rr.p4 = rr.p4 || new Float32Array(rr.mat.length); rr.p4[c] = EI; }
+      await setup(rr, { type: 'river', h0: zb + 0.30, q, hout: 0.28 });
+      const dtp = stepFor(dx, 0.5); await M.debug.steps(Math.round(40 / dtp), dtp);
+      const [eu, ed] = await meanEta([2.5, 3 + Lp + 0.5], 5, dtp);
+      drops[EI] = eu - ed;
+      if (EI < 1) {
+        const po = await M.debug.read('po'), u = await M.debug.read('u'), i = Math.round(4 / dx), l = 0.20;
+        let us = 0, n = 0; for (let k = Math.floor(zb / dx); k < Math.ceil((zb + l) / dx); k++) { us += 0.5 * (u[i + (rr.nx + 1) * k] + u[i + 1 + (rr.nx + 1) * k]); n++; }
+        Ucan = us / n; const Ca = 1000 * cd * stem * Ucan * Ucan * l ** 3 / EI;
+        rLN = Math.min(1, Math.max(0.05, 1 - (1 - 0.9 * Math.pow(Ca, -1 / 3)) / (1 + 8 * Math.pow(Ca, -1.5)))); rGPU = po[2 * i];
+      }
+    }
+    check('flexible plants bend as Luhar & Nepf for the canopy velocity (within 2%)', rGPU > 0 && Math.abs(rGPU / rLN - 1) < 0.02, 'l_e/l ' + rGPU.toFixed(3) + ' vs ' + rLN.toFixed(3) + ' at ' + (Ucan * 100).toFixed(1) + ' cm/s');
+    check('a flexible meadow resists less than the same meadow rigid', drops[2e-5] > 0 && drops[2e-5] < 0.9 * drops[1e6], 'head drop ' + (drops[2e-5] * 1000).toFixed(1) + ' mm flexible vs ' + (drops[1e6] * 1000).toFixed(1) + ' mm rigid, bent to ' + (100 * rGPU).toFixed(0) + '% of its length');
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

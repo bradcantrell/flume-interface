@@ -497,6 +497,26 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
         cs[3u*c1+q] = max(Cb + prm.dt*(E - D)/dx, 0.0);
         colx[6u*i+q] = D - E;
       }`),
+    // flexible plants (Luhar & Nepf 2011), per column: the Cauchy number Ca = rho Cd d u^2 l^3 / EI
+    // from the mean velocity over the plants gives the effective length
+    // l_e / l = 1 - (1 - 0.9 Ca^(-1/3)) / (1 + 8 Ca^(-3/2)); bent plants drag only over their lower
+    // l_e (pf = 1 below base + l_e, 0 above). Quasi-static: under waves the meadow sways with each wave.
+    // pl per column: base (m), length (m), stem d (m), Cd, EI (N m2); out: l_e/l and flow direction
+    plantBend: K([['u', 'f'], ['pl', 'f'], ['pf', 'f'], ['po', 'f']], `let i = c; if (i >= prm.nx) {return;}
+      let N = prm.nx; let W = prm.nx + 1u; let dx = prm.dx;
+      let base = pl[5u*i]; let l = pl[5u*i+1u];
+      if (l <= 0.0) { po[2u*i] = 1.0; po[2u*i+1u] = 0.0; return; }
+      let k0 = u32(floor(base/dx)); let k1 = min(u32(ceil((base + l)/dx)), prm.nz);
+      var us = 0.0; var n = 0.0;
+      for (var k = k0; k < k1; k++) { us += 0.5*(u[i+W*k] + u[i+1u+W*k]); n += 1.0; }
+      let U = select(0.0, us/n, n > 0.0);
+      let Ca = 1000.0*pl[5u*i+3u]*pl[5u*i+2u]*U*U*l*l*l/max(pl[5u*i+4u], 1e-12);
+      var r = 1.0;
+      if (Ca > 1e-6) { r = 1.0 - (1.0 - 0.9*pow(Ca, -1.0/3.0))/(1.0 + 8.0*pow(Ca, -1.5)); }
+      r = clamp(r, 0.05, 1.0);
+      po[2u*i] = r; po[2u*i+1u] = select(0.0, sign(U), abs(U) > 1e-4);
+      let top = base + r*l;
+      for (var k = k0; k < k1; k++) { pf[i + N*k] = select(0.0, 1.0, (f32(k) + 0.5)*dx < top); }`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -664,11 +684,11 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
       o[c] = wc + prm.dt*nu*lap/(prm.dx*prm.dx);`),
     // implicit drag: porous (Darcy-Forchheimer) and plants (cell arrays A, B per direction),
     // plus log-law friction on faces that run along a wall: u /= 1 + dt (A + B |u|)
-    dragU: K([['u', 'f'], ['solid', 'u'], ['dg', 'f'], ['ks', 'f'], ['BU', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W; let N = prm.nx;
+    dragU: K([['u', 'f'], ['solid', 'u'], ['dg', 'f'], ['ks', 'f'], ['BU', 'f'], ['pf', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W; let N = prm.nx;
       BU[c] = 1.0;
       if (i == 0u || i == prm.nx) { return; }
       let l = i-1u+N*k; let r = i+N*k; if (solid[l] != 0u || solid[r] != 0u) { return; }
-      let A = 0.5*(dg[2u*l] + dg[2u*r]); var B = 0.5*(dg[2u*l+1u] + dg[2u*r+1u]);
+      let A = 0.5*(dg[2u*l] + dg[2u*r]); var B = 0.5*(dg[2u*l+1u]*pf[l] + dg[2u*r+1u]*pf[r]);
       var kw = 0.0;
       if (k > 0u) { let a = l - N; let b = r - N; if (solid[a] != 0u) { kw = max(kw, ks[a]); } if (solid[b] != 0u) { kw = max(kw, ks[b]); } }
       if (k < prm.nz-1u) { let a = l + N; let b = r + N; if (solid[a] != 0u) { kw = max(kw, ks[a]); } if (solid[b] != 0u) { kw = max(kw, ks[b]); } }
@@ -913,7 +933,7 @@ fn smp(i:i32, k:i32) -> f32 {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
@@ -955,6 +975,7 @@ fn smp(i:i32, k:i32) -> f32 {
       sedExner: D('sedExner', P0, [B.qb, B.bed, B.colx, B.cell, SPU], nx),
       sedAvalR: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 0 }),
       sedAvalB: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 1 }),
+      plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
       sedCells: D('sedCells', P0, [B.solid, B.f, B.bed, B.cell, B.colx, B.tb, B.ks, B.cs, SPU], N),
@@ -975,7 +996,7 @@ fn smp(i:i32, k:i32) -> f32 {
       speed: D('speed', P0, [B.u, B.w, B.typ, B.tmp], N),
       nut: D('nut', P0, [B.u, B.w, B.typ, B.nt], N),
       diffU: D('diffU', P0, [B.u, B.typ, B.nt, B.u2], NU), diffW: D('diffW', P0, [B.w, B.typ, B.nt, B.w2], NW),
-      dragU: D('dragU', P0, [B.u, B.solid, B.dgX, B.ks, B.BU], NU), dragW: D('dragW', P0, [B.w, B.solid, B.dgZ, B.ks, B.BW], NW),
+      dragU: D('dragU', P0, [B.u, B.solid, B.dgX, B.ks, B.BU, B.pf], NU), dragW: D('dragW', P0, [B.w, B.solid, B.dgZ, B.ks, B.BW], NW),
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
@@ -1022,6 +1043,18 @@ fn smp(i:i32, k:i32) -> f32 {
       zs[i] = kf * dx; zfix[i] = kx * dx; zcap[i] = ku * dx;
     }
     M.bed0 = { solid: solid.slice(), ks: ks.slice(), comp, tdep, zs, zfix, zcap, mat: m.slice() };
+    // plant columns: the lowest run of plant cells in each column (base, length, stem, Cd, EI)
+    const pl = new Float32Array(5 * nx), pf = new Float32Array(N).fill(1); M.hasPlants = false;
+    for (let i = 0; i < nx; i++) {
+      let k0 = 0; while (k0 < nz && m[i + nx * k0] !== 3) k0++; if (k0 >= nz) continue;
+      let k1 = k0; while (k1 < nz && m[i + nx * k1] === 3) k1++;
+      const c0 = i + nx * k0; M.hasPlants = true;
+      pl[5 * i] = k0 * dx; pl[5 * i + 1] = (k1 - k0) * dx; pl[5 * i + 2] = raster.p3[c0] || 0.006; pl[5 * i + 3] = raster.p2[c0] || 1;
+      pl[5 * i + 4] = raster.p4 && raster.p4[c0] > 0 ? raster.p4[c0] : 1e6;
+    }
+    M.device.queue.writeBuffer(M.S.B.pl, 0, pl); M.device.queue.writeBuffer(M.S.B.pf, 0, pf);
+    M.device.queue.writeBuffer(M.S.B.po, 0, new Float32Array(2 * nx).fill(1));
+    M.plantHost = null;
     writeBed();
     M.device.queue.writeBuffer(M.S.B.dgX, 0, dgX); M.device.queue.writeBuffer(M.S.B.dgZ, 0, dgZ); M.device.queue.writeBuffer(M.S.B.ks, 0, ks);
     M.applyParams();
@@ -1071,7 +1104,7 @@ fn smp(i:i32, k:i32) -> f32 {
 
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
   M.reset = function () {
-    M.t = 0; M.etaHost = null;
+    M.t = 0; M.etaHost = null; M.plantHost = null;
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
     const h0 = M.p.h0;
@@ -1121,7 +1154,7 @@ fn smp(i:i32, k:i32) -> f32 {
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
     pass = enc.beginComputePass(); run(pass, d.spongeU); run(pass, d.spongeW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.nut); run(pass, d.diffU); run(pass, d.diffW); pass.end();
     enc.copyBufferToBuffer(B.u2, 0, B.u, 0, M.S.NU * 4); enc.copyBufferToBuffer(B.w2, 0, B.w, 0, M.S.NW * 4);
-    pass = enc.beginComputePass(); run(pass, d.dragU); run(pass, d.dragW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.classify); pass.end();
+    pass = enc.beginComputePass(); if (M.hasPlants) run(pass, d.plantBend); run(pass, d.dragU); run(pass, d.dragW); run(pass, d.bcU); run(pass, d.bcW); run(pass, d.classify); pass.end();
     encodePressure(enc);
     pass = enc.beginComputePass();
     run(pass, d.projU); run(pass, d.projW); run(pass, d.bcU); run(pass, d.bcW);
@@ -1178,6 +1211,7 @@ fn smp(i:i32, k:i32) -> f32 {
     if (M.frameNo % 6 === 0 && !M.readBusy) readScalars();
     if (M.watching && M.frameNo % 2 === 0 && !M.etaBusy) readSurface();
     if (M.p.sediment && running && M.frameNo % 30 === 0 && !M.bedBusy) readBed();
+    if (M.hasPlants && running && M.frameNo % 3 === 0 && !M.plantBusy) readPlants();
   };
   // the moving bed, for drawing: which cells are sediment, their mix and deposit time
   function readBed() {
@@ -1200,6 +1234,19 @@ fn smp(i:i32, k:i32) -> f32 {
       if (M.api && M.api.bedChanged) M.api.bedChanged({ mat, comp, tdep });
       M.bedBusy = false;
     }, () => { M.bedBusy = false; });
+  }
+  // plants' bend per column, for drawing the stems
+  M.plantSample = function () { return M.hasPlants ? M.plantHost : null; };
+  function readPlants() {
+    if (!M.S) return;
+    M.plantBusy = true; const B = M.S.B.po, n = M.grid.nx;
+    const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const e = M.device.createCommandEncoder(); e.copyBufferToBuffer(B, 0, st, 0, B.size); M.device.queue.submit([e.finish()]);
+    st.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new Float32Array(st.getMappedRange().slice(0, 2 * n * 4)); st.unmap(); st.destroy();
+      const le = new Float32Array(n), dir = new Float32Array(n); for (let i = 0; i < n; i++) { le[i] = a[2 * i]; dir[i] = a[2 * i + 1]; }
+      M.plantHost = { le, dir }; M.plantBusy = false;
+    }, () => { M.plantBusy = false; });
   }
   // gauges: the surface height per column, read back every other frame while gauges exist
   M.watchSurface = function (on) { M.watching = !!on; };

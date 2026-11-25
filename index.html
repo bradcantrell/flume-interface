@@ -149,7 +149,7 @@ const GRAIN = [
 const MAT_INFO = {
   1: { label: 'solid', props: [] },
   2: { label: 'porous (rock, reef)', props: [['n', 'porosity', 0.1, 0.9, 0.01, 0.4, 0.4], ['d', 'stone size (m)', 0.001, 5, 0.001, 0.04, 0.8]] },
-  3: { label: 'plants (canopy)', props: [['a', 'frontal area (1/m)', 0.1, 200, 0.1, 8, 1.5], ['cd', 'drag coefficient', 0.2, 3, 0.05, 1.0, 1.0], ['stem', 'stem diameter (m)', 0.0005, 1, 0.0005, 0.006, 0.05]] },
+  3: { label: 'plants (canopy)', props: [['a', 'frontal area (1/m)', 0.1, 200, 0.1, 8, 1.5], ['cd', 'drag coefficient', 0.2, 3, 0.05, 1.0, 1.0], ['stem', 'stem diameter (m)', 0.0005, 1, 0.0005, 0.006, 0.05], ['EI', 'stiffness EI (N·m²)', 1e-8, 1e6, 'any', 1e-4, 0.05]] },
   4: { label: 'sediment', props: [['cls', 'grain class', 0, 2, 1, 0, 0]] },
 };
 
@@ -229,8 +229,8 @@ function contains(sh, x, z) {
 // ───────── raster ─────────
 function rasterize() {
   const { nx, nz, dx } = GRID, N = nx * nz;
-  if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), cls: new Uint8Array(N) };
-  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.cls.fill(0); R.comp = null; R.tdep = null;
+  if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), p4: new Float32Array(N), cls: new Uint8Array(N) };
+  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.p4.fill(0); R.cls.fill(0); R.comp = null; R.tdep = null;
   // the bed: everything under the profile is sediment of the bed's class
   for (let i = 0; i < nx; i++) {
     const zb = bedZ((i + 0.5) * dx), kb = Math.min(nz, Math.round(zb / dx));
@@ -248,9 +248,9 @@ function rasterize() {
       if (!contains(sh, (i + 0.5) * dx, (k + 0.5) * dx)) continue;
       const c = i + nx * k;
       if (onlyWater && (R.mat[c] === MAT.SOLID || R.mat[c] === MAT.SEDIMENT)) continue;
-      R.mat[c] = sh.mat; R.p1[c] = 0; R.p2[c] = 0; R.p3[c] = 0; R.cls[c] = 0;
+      R.mat[c] = sh.mat; R.p1[c] = 0; R.p2[c] = 0; R.p3[c] = 0; R.p4[c] = 0; R.cls[c] = 0;
       if (sh.mat === MAT.POROUS) { R.p1[c] = pr.n; R.p2[c] = pr.d; }
-      else if (sh.mat === MAT.CANOPY) { R.p1[c] = pr.a; R.p2[c] = pr.cd; R.p3[c] = pr.stem; }
+      else if (sh.mat === MAT.CANOPY) { R.p1[c] = pr.a; R.p2[c] = pr.cd; R.p3[c] = pr.stem; R.p4[c] = pr.EI != null ? pr.EI : 1e6; }
       else if (sh.mat === MAT.SEDIMENT) { R.cls[c] = pr.cls | 0; }
     }
   }
@@ -503,8 +503,17 @@ function drawUI(now) {
   if (matCanvas) c.drawImage(matCanvas, X0, Y0, X1 - X0, Y1 - Y0);
   // plant stems
   if (stems.length) {
+    // flexible plants bend: the model gives each column its effective length l_e/l and the flow's
+    // direction; the stem keeps its length, so its tip sits at l_e high and sqrt(l^2 - l_e^2) along
+    const bend = model && model.plantSample ? model.plantSample() : null;
     c.strokeStyle = 'rgba(132, 200, 110, 0.85)'; c.lineWidth = Math.max(1, Math.min(2.2, view.s * GRID.dx * 0.5)); c.beginPath();
-    for (const st of stems) { const [Xa, Ya] = w2s(st.x, st.z0), [, Yb] = w2s(st.x, st.z1); c.moveTo(Xa, Ya); c.lineTo(Xa + st.lean * (Ya - Yb) * 0.2, Yb); }
+    for (const st of stems) {
+      const l = st.z1 - st.z0; let r = 1, dir = 0;
+      if (bend) { const i = Math.max(0, Math.min(bend.le.length - 1, Math.floor(st.x / GRID.dx))); r = Math.max(0.05, Math.min(1, bend.le[i])); dir = bend.dir[i]; }
+      const tipZ = st.z0 + l * r, tipX = st.x + dir * l * Math.sqrt(Math.max(0, 1 - r * r)) + st.lean * l * 0.15 * r;
+      const [Xa, Ya] = w2s(st.x, st.z0), [Xc, Yc] = w2s(st.x, st.z0 + l * r * 0.55), [Xb, Yb] = w2s(tipX, tipZ);
+      c.moveTo(Xa, Ya); c.quadraticCurveTo(Xc, Yc, Xb, Yb);
+    }
     c.stroke();
   }
   // flume walls
@@ -951,6 +960,8 @@ function wire() {
 //     surfaceSample() -> { t, eta, dx },   // optional: the latest surface height per column (m;
 //                                          // negative where a column has no water), at model time t
 //     gaugeWindow() -> seconds,            // optional: window for the gauges' wave height
+//     plantSample() -> { le, dir },        // optional: per column, plants' effective length / length
+//                                          // (1 upright) and the flow direction (-1, 0, 1), for drawing
 //   });
 // A model that moves the bed calls api.bedChanged({ mat, comp, tdep }): mat as the raster, comp the
 // mix of grain classes per cell (3 per cell), tdep the bed time each cell was laid down (< 0: from
@@ -959,7 +970,8 @@ function wire() {
 // The raster: nx x nz cells, index i + nx * k (k = 0 at the floor), cell size dx metres.
 //   mat[c]: 0 water/air, 1 solid, 2 porous, 3 canopy, 4 sediment
 //   porous:   p1 = porosity, p2 = stone size (m)
-//   canopy:   p1 = frontal area per volume (1/m), p2 = drag coefficient, p3 = stem diameter (m)
+//   canopy:   p1 = frontal area per volume (1/m), p2 = drag coefficient, p3 = stem diameter (m),
+//             p4 = flexural rigidity EI (N m2)
 //   sediment: cls = grain class (index into GRAIN)
 // The view: { x0, z0, s (CSS px per metre), ve (vertical exaggeration), cw, ch (CSS px), dpr };
 // a world point (x, z) is at ((x - x0) * s, ch - (z - z0) * s * ve) in CSS px.
