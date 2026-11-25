@@ -517,6 +517,41 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
       po[2u*i] = r; po[2u*i+1u] = select(0.0, sign(U), abs(U) > 1e-4);
       let top = base + r*l;
       for (var k = k0; k < k1; k++) { pf[i + N*k] = select(0.0, 1.0, (f32(k) + 0.5)*dx < top); }`),
+    // dye: a passive tracer released by the dye tool, carried by the flow (van Leer upwind, the same
+    // flux form as the suspended load) with a little diffusion; nothing crosses into air or solids
+    dyeAdv: K([['u', 'f'], ['w', 'f'], ['typ', 'u'], ['cs', 'f'], ['co', 'f']], `if (c >= prm.nx*prm.nz) {return;}
+      let N = prm.nx; let W = prm.nx + 1u; let i = c % N; let k = c / N; let dx = prm.dx; let q = 0u;
+      if (typ[c] != 1u) { co[c] = cs[c]*select(1.0, 0.0, typ[c] == 0u); return; }
+      let C = cs[c]; let Kd = 2e-4*dx/0.01;
+      var fe = 0.0;
+      if (i + 1u < N) { let cn = c + 1u; if (typ[cn] == 1u) { let ue = u[i+1u+W*k];
+        let ce = select(face(cv(i32(i)+2, i32(k), q, cs[cn]), cs[cn], C), face(cv(i32(i)-1, i32(k), q, C), C, cs[cn]), ue > 0.0);
+        fe = ue*ce - Kd*(cs[cn] - C)/dx; } }
+      else { fe = max(u[i+1u+W*k], 0.0)*C; }
+      var fw = 0.0;
+      if (i > 0u) { let cn = c - 1u; if (typ[cn] == 1u) { let uw = u[i+W*k];
+        let cw = select(face(cv(i32(i)+1, i32(k), q, C), C, cs[cn]), face(cv(i32(i)-2, i32(k), q, cs[cn]), cs[cn], C), uw > 0.0);
+        fw = uw*cw - Kd*(C - cs[cn])/dx; } }
+      else { fw = min(u[i+W*k], 0.0)*C; }
+      var fN = 0.0;
+      if (k + 1u < prm.nz) { let cn = c + N; if (typ[cn] == 1u) { let wn = w[i+N*(k+1u)];
+        let cf = select(face(cv(i32(i), i32(k)+2, q, cs[cn]), cs[cn], C), face(cv(i32(i), i32(k)-1, q, C), C, cs[cn]), wn > 0.0);
+        fN = wn*cf - Kd*(cs[cn] - C)/dx; } }
+      var fS = 0.0;
+      if (k > 0u) { let cn = c - N; if (typ[cn] == 1u) { let wsf = w[i+N*k];
+        let cf = select(face(cv(i32(i), i32(k)+1, q, C), C, cs[cn]), face(cv(i32(i), i32(k)-2, q, cs[cn]), cs[cn], C), wsf > 0.0);
+        fS = wsf*cf - Kd*(C - cs[cn])/dx; } }
+      co[c] = clamp(C - prm.dt/dx*(fe - fw + fN - fS), 0.0, 1.0);`, MM + `fn cv(i:i32, k:i32, q:u32, fb:f32) -> f32 { if (i < 0 || k < 0 || i >= i32(prm.nx) || k >= i32(prm.nz)) { return fb; } let c = u32(i) + prm.nx*u32(k); if (typ[c] != 1u) { return fb; } return cs[c]; }
+fn vl(a:f32, b:f32) -> f32 { if (a*b <= 0.0) { return 0.0; } return 2.0*a*b/(a + b); }
+fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu); }
+`),
+    // inject dye in a disc (x, z, r, amount) from the DI uniform
+    dyeInject: K([['f', 'f'], ['solid', 'u'], ['dye', 'f'], ['DI', 'U']], `if (c >= prm.nx*prm.nz) {return;}
+      let N = prm.nx; let x = (f32(c % N) + 0.5)*prm.dx; let z = (f32(c / N) + 0.5)*prm.dx;
+      let dx2 = x - spv(0u); let dz2 = z - spv(1u); let r = max(spv(2u), prm.dx);
+      let d2 = (dx2*dx2 + dz2*dz2)/(r*r);
+      if (d2 > 1.0 || solid[c] != 0u || f[c] < 0.5) { return; }
+      dye[c] = max(dye[c], spv(3u)*(1.0 - d2*d2));`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -718,6 +753,8 @@ struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32,
 @group(0) @binding(3) var<storage, read> u: array<f32>;
 @group(0) @binding(4) var<storage, read> w: array<f32>;
 @group(0) @binding(5) var<storage, read> eta: array<f32>;
+@group(0) @binding(6) var<storage, read> dye: array<f32>;
+@group(0) @binding(7) var<storage, read> cs: array<f32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
   return vec4f(p[i], 0.0, 1.0);
@@ -759,6 +796,20 @@ fn smp(i:i32, k:i32) -> f32 {
     let c1 = mix(vec3f(0.05, 0.12, 0.35), vec3f(0.10, 0.65, 0.80), clamp(sp*2.0, 0.0, 1.0));
     col = mix(c1, vec3f(1.0, 0.86, 0.45), clamp(sp*2.0 - 1.0, 0.0, 1.0));
   }
+  // suspended sediment: a sandy cloud by volume concentration (all classes)
+  let sc = cs[3u*cc] + cs[3u*cc + 1u] + cs[3u*cc + 2u];
+  col = mix(col, vec3f(0.62, 0.50, 0.33), clamp(sqrt(sc/0.004), 0.0, 0.85));
+  // dye
+  let dv = dye[cc];
+  col = mix(col, vec3f(0.95, 0.30, 0.55), clamp(dv*1.4, 0.0, 0.92));
+  // foam: fast shear near the surface (jumps, breaking waves, nappes)
+  let W1 = u32(nx + 1); let ci1 = u32(clamp(ci, 1, nx - 2)); let ck1 = u32(clamp(ck, 1, nz - 2));
+  let dudz = (u[ci1 + W1*(ck1 + 1u)] - u[ci1 + W1*(ck1 - 1u)]) / (2.0*V0.dx);
+  let dwdx = (w[ci1 + 1u + u32(nx)*ck1] - w[ci1 - 1u + u32(nx)*ck1]) / (2.0*V0.dx);
+  let shear = abs(dudz) + abs(dwdx);
+  let nearSurf = 1.0 - clamp(d / (4.0*V0.dx), 0.0, 1.0);
+  let foam = clamp((shear - 6.0) / 14.0, 0.0, 1.0) * nearSurf;
+  col = mix(col, vec3f(0.93, 0.97, 1.0), foam*0.75);
   // bright line along the free surface
   let hl = 1.0 - clamp(abs(fv - 0.5) / (dfv*1.6), 0.0, 1.0);
   col = mix(col, vec3f(0.88, 0.97, 1.0), hl*0.85);
@@ -933,11 +984,12 @@ fn smp(i:i32, k:i32) -> f32 {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
     const SPU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const DIU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
     while (L[L.length - 1].nx > 8 && L[L.length - 1].nz > 4) {
       const f = L[L.length - 1], cnx = Math.ceil(f.nx / 2), cnz = Math.ceil(f.nz / 2), n = cnx * cnz;
@@ -975,6 +1027,8 @@ fn smp(i:i32, k:i32) -> f32 {
       sedExner: D('sedExner', P0, [B.qb, B.bed, B.colx, B.cell, SPU], nx),
       sedAvalR: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 0 }),
       sedAvalB: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 1 }),
+      dyeAdv: D('dyeAdv', P0, [B.u, B.w, B.typ, B.dye, B.dye2], N),
+      dyeInject: D('dyeInject', P0, [B.f, B.solid, B.dye, DIU], N),
       plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
@@ -1000,7 +1054,7 @@ fn smp(i:i32, k:i32) -> f32 {
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, SPU, N, NU, NW, all: all.concat([P0, SPU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, DIU, N, NU, NW, all: all.concat([P0, SPU, DIU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -1040,7 +1094,11 @@ fn smp(i:i32, k:i32) -> f32 {
       if (kf >= nz) { zs[i] = zfix[i] = -1; zcap[i] = -1; continue; }
       let kx = kf; while (kx > 0 && m[i + nx * (kx - 1)] === 4) kx--;
       let ku = kf; while (ku < nz && m[i + nx * ku] !== 1 && m[i + nx * ku] !== 4) ku++;
-      zs[i] = kf * dx; zfix[i] = kx * dx; zcap[i] = ku * dx;
+      zfix[i] = kx * dx; zcap[i] = ku * dx;
+      // the bed height inside its cells: the drawn bed's coverage (raster.frac) when the interface gives
+      // it, so a gentle slope starts as a slope and not as whole-cell steps; else the whole cells
+      if (raster.frac) { let z = kx * dx; for (let k = kx; k < ku; k++) { const fr = raster.frac[i + nx * k]; if (!(fr > 0)) break; z += Math.min(1, fr) * dx; } zs[i] = Math.max(Math.min(z, ku * dx - 0.01 * dx), kx * dx); }
+      else zs[i] = kf * dx;
     }
     M.bed0 = { solid: solid.slice(), ks: ks.slice(), comp, tdep, zs, zfix, zcap, mat: m.slice() };
     // plant columns: the lowest run of plant cells in each column (base, length, stem, Cd, EI)
@@ -1104,7 +1162,8 @@ fn smp(i:i32, k:i32) -> f32 {
 
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
   M.reset = function () {
-    M.t = 0; M.etaHost = null; M.plantHost = null;
+    M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false;
+    if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
     const h0 = M.p.h0;
@@ -1166,6 +1225,7 @@ fn smp(i:i32, k:i32) -> f32 {
     if (n & 1) { run(pass, d.fluxX); run(pass, d.updX); run(pass, d.fluxZ); run(pass, d.updZ); }
     else { run(pass, d.fluxZ); run(pass, d.updZ); run(pass, d.fluxX); run(pass, d.updX); }
     run(pass, d.tick);
+    if (M.dyeOn) { run(pass, d.classify); run(pass, d.dyeAdv); pass.end(); enc.copyBufferToBuffer(B.dye2, 0, B.dye, 0, M.S.N * 4); pass = enc.beginComputePass(); }
     if (M.p.sediment) {
       run(pass, d.surface); run(pass, d.classify); run(pass, d.sedShear); run(pass, d.susAdv);
       pass.end(); enc.copyBufferToBuffer(B.cs2, 0, B.cs, 0, M.S.N * 12); pass = enc.beginComputePass();
@@ -1231,10 +1291,18 @@ fn smp(i:i32, k:i32) -> f32 {
       for (let c = 0; c < N; c++) mat[c] = m0[c] === 1 ? 1 : solid[c] ? 4 : (m0[c] === 4 ? 0 : m0[c]);
       let lo = 0, hi = 0; for (let i = 0; i < zs.length; i++) if (M.bed0.zs[i] >= 0) { const d = zs[i] - M.bed0.zs[i]; lo = Math.min(lo, d); hi = Math.max(hi, d); }
       M.zsHost = zs; M.bedRange = [lo, hi];
-      if (M.api && M.api.bedChanged) M.api.bedChanged({ mat, comp, tdep });
+      if (M.api && M.api.bedChanged) M.api.bedChanged({ mat, comp, tdep, zs, zfix: M.bed0.zfix });
       M.bedBusy = false;
     }, () => { M.bedBusy = false; });
   }
+  // dye tool: release dye in a disc at (x, z) of radius r (m)
+  M.injectDye = function (x, z, r) {
+    if (!M.ok || !M.S) return;
+    M.device.queue.writeBuffer(M.S.DIU, 0, new Float32Array([x, z, r, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    const e = M.device.createCommandEncoder(), pass = e.beginComputePass(); run(pass, M.S.d.dyeInject); pass.end(); M.device.queue.submit([e.finish()]);
+    M.dyeOn = true;
+  };
+  M.clearDye = function () { if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N)); M.dyeOn = false; };
   // plants' bend per column, for drawing the stems
   M.plantSample = function () { return M.hasPlants ? M.plantHost : null; };
   function readPlants() {
@@ -1284,7 +1352,7 @@ fn smp(i:i32, k:i32) -> f32 {
         fragment: { module, entryPoint: 'fs', targets: [{ format: M.format }] }, primitive: { topology: 'triangle-list' } });
       const U = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const B = M.S.B;
-      const bg = M.device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [U, B.f, B.solid, B.u, B.w, B.eta].map((b, j) => ({ binding: j, resource: { buffer: b } })) });
+      const bg = M.device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [U, B.f, B.solid, B.u, B.w, B.eta, B.dye, B.cs].map((b, j) => ({ binding: j, resource: { buffer: b } })) });
       M.render_ = { p, U, bg };
     }
     const g = M.grid, r = view.dpr || 1;

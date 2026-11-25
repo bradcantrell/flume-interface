@@ -24,13 +24,14 @@ function makeEl(id, tag = 'div') {
     dispatch(t, e = {}) { for (const fn of this.listeners[t] || []) fn(Object.assign({ target: this, preventDefault() {} }, e)); },
     getContext: () => el._ctx || (el._ctx = ctxProxy()),
     getBoundingClientRect: () => ({ left: 0, top: 0, width: W, height: H }),
-    setPointerCapture() {}, appendChild() {}, remove() {}, click() { this.dispatch('click'); },
+    setPointerCapture() {}, appendChild() {}, remove() {}, click() { this.dispatch('click'); if (this.download) downloads.push(this.download); },
+    toBlob(cb) { cb({ size: 1 }); },
     querySelectorAll(sel) { return queryAll(sel, this); },
   };
   Object.defineProperty(el, 'innerHTML', { get() { return el._html; }, set(v) { el._html = v; parseInto(v); } });
   return el;
 }
-const els = {};
+const els = {}, downloads = [];
 function getEl(id) {
   if (!els[id]) {
     if (!markupIds.has(id) && !dynamicIds.has(id)) missingIds.add(id);
@@ -75,7 +76,7 @@ vm.createContext(sandbox);
 
 // ───────── stub model ─────────
 const STUB = `
-const calls = { watch: [], init: 0, setGrid: 0, setRaster: 0, reset: 0, frame: 0, framesRunning: 0, render: 0, setScale: [] };
+const calls = { watch: [], dye: [], init: 0, setGrid: 0, setRaster: 0, reset: 0, frame: 0, framesRunning: 0, render: 0, setScale: [] };
 registerModel({
   id: 'stub', calls, p: { speed: 1 },
   async init(api) { calls.init++; calls.api = api; return { ok: false, reason: 'stub model' }; },
@@ -90,6 +91,7 @@ registerModel({
   watchSurface(on) { calls.watch.push(on); },
   surfaceSample() { return calls.sample || null; },
   gaugeWindow() { return 10; },
+  injectDye(x, z, r) { calls.dye.push([x, z, r]); }, clearDye() { calls.dyeCleared = (calls.dyeCleared || 0) + 1; },
   state() { return { stubState: 7 }; }, setState(s) { calls.state = s; },
   controls: { html: '<div class="row"><label for="stub-x">x</label><input id="stub-x" type="number"></div>' },
 });`;
@@ -280,6 +282,18 @@ const run = (code) => vm.runInContext(code, sandbox);
   const sr = C.setRaster, rs2 = C.reset;
   T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('restart goes back to the drawn design and gives the model that bed', T.rasterHash() === h0 && !T.RASTER.comp && C.setRaster === sr + 1 && C.reset === rs2 + 1);
+
+  // 13. stage 5: the dye tool, clear dye, and a still image
+  T.setTool('dye');
+  const [Xd, Yd] = T.w2s(6, 0.4);
+  T.onDown({ offsetX: Xd, offsetY: Yd, button: 0 }); T.onMove({ offsetX: Xd + 30, offsetY: Yd }); T.onUp({});
+  check('the dye tool releases dye where clicked and along a drag', C.dye.length >= 2 && Math.abs(C.dye[0][0] - 6) < 0.05 && Math.abs(C.dye[0][1] - 0.4) < 0.02 && C.dye[0][2] > 0);
+  getEl('clear-dye').dispatch('click');
+  check('clear dye asks the model to clear it', C.dyeCleared === 1);
+  getEl('still').dispatch('click'); run('frame(9000)');
+  check('save image composites the view and downloads a PNG', downloads.includes('flume.png'));
+  const mi = run('({ w: matCanvas.width, h: matCanvas.height, ux: matUX, uz: matUZ })');
+  check('the material image is drawn finer than the grid (smooth outlines)', mi.w === T.GRID.nx * mi.ux && mi.h === T.GRID.nz * mi.uz && mi.ux >= 2 && mi.uz >= 2, JSON.stringify(mi));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

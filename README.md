@@ -8,7 +8,7 @@ It belongs to the same family as the [Sediment Interface](https://bradcantrell.g
 The water is computed on the GPU with WebGPU, so it needs a browser with WebGPU (recent Chrome
 or Edge, or Safari 26 and later).
 
-## What it does now (stage 4)
+## What it does now (stage 5)
 
 - A 2D section of a lab flume (20 m by 1 m) or a field reach (400 m by 16 m), at draft, normal, or fine grid resolution.
 - Drawing tools are a brush, line, polygon, rectangle, ellipse, eraser, and a bed profile editor. Shapes stay editable (select, move, resize, reorder, delete, and undo).
@@ -19,6 +19,9 @@ or Edge, or Safari 26 and later).
 - **A moving bed.** Sediment moves as bedload (Meyer-Peter and Mueller, from the bed shear stress) and in suspension (carried by the flow, settling at each grain's fall velocity, picked up from the bed by van Rijn's reference concentration). The bed follows the Exner equation, slopes steeper than 32 degrees slump, and sediment under a solid or below a fixed sill stays put. Three grain classes sort themselves. The top layer of the bed changes its mix with what leaves and arrives, so a sediment-starved river armours its bed with gravel. Deposits are drawn banded by when they were laid down. A bed speed-up factor lets the bed change faster than the water, and a river brings in sediment at equilibrium or runs clear.
 - **Flexible plants.** Plants have a stiffness (flexural rigidity EI). They bend in the flow as Luhar and Nepf (2011) describe, drag only over their bent length, and sway with each wave. A large stiffness makes them rigid. The OpenFOAM export treats them as rigid.
 - **Gauges.** Place water-level gauges anywhere along the flume. Each shows its level over the last 30 seconds, its mean level and wave height, and with two or more gauges each one's wave height relative to the first (wave transmission behind a reef or breakwater).
+- **Dye.** Click or drag in the water to release dye and watch the flow carry it.
+- **The look.** Beds and shapes are drawn with smooth outlines, suspended sediment shows as a sandy cloud, and foam gathers where fast water meets the surface.
+- **Images and video.** Save the view as a PNG, or record it as a video for a presentation or a reel.
 - Scenes save to and open from a `scene.json` file, and the last scene is kept in the browser.
 - **OpenFOAM export.** The flume you drew becomes a 2D OpenFOAM case (OpenFOAM 12 or later, `foamRun` with `incompressibleVoF`), with the same porous and plant drag, probes of the water surface along the flume, and k-epsilon turbulence with rough walls for a river or laminar flow for waves (k-epsilon is the choice when waves break).
 

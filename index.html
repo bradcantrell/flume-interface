@@ -70,6 +70,7 @@
       <button data-tool="rect" title="Rectangle (5)"><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="10" rx="1"/></svg></button>
       <button data-tool="ellipse" title="Ellipse (6)"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="5.5"/></svg></button>
       <button data-tool="erase" title="Eraser, carves water (7)"><svg viewBox="0 0 24 24"><path d="M8 20h12M5 15l8-9 6 6-8 8H9z"/></svg></button>
+      <button data-tool="dye" title="Dye: click or drag to release dye (D)"><svg viewBox="0 0 24 24"><path d="M12 3c3 5 6 8 6 11a6 6 0 0 1-12 0c0-3 3-6 6-11z"/></svg></button>
       <button data-tool="gauge" title="Water-level gauge (9)"><svg viewBox="0 0 24 24"><path d="M12 3v18M8 7h8M9 11h6M8 15h8"/></svg></button>
       <button data-tool="bed" title="Edit the bed profile (8)"><svg viewBox="0 0 24 24"><path d="M3 16c4-5 6 1 9-3s5-1 9-4"/><circle cx="12" cy="13" r="1.6"/></svg></button>
     </div>
@@ -81,6 +82,7 @@
     <div class="btns">
       <button id="run" class="primary">run</button>
       <button id="restart">restart</button>
+      <button id="clear-dye" title="Clear the dye">clear dye</button>
       <select id="speed" title="model seconds per real second"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>real time</option><option value="2">2× speed</option><option value="4">4× speed</option></select>
     </div>
 
@@ -107,6 +109,7 @@
     <h2>Scene</h2>
     <div class="btns">
       <button id="undo">undo</button><button id="save">save</button><button id="open">open</button><button id="clear">clear</button>
+      <button id="still" title="Save the view as a PNG">save image</button><button id="record" title="Record the view as a WebM video">record video</button>
       <input id="open-file" type="file" accept=".json,application/json" hidden>
     </div>
     <div id="site-slot"></div>
@@ -116,7 +119,7 @@
 
     <div id="keys">
       <kbd>Space</kbd> run/pause &middot; <kbd>R</kbd> restart &middot; <kbd>1</kbd>–<kbd>9</kbd> tools<br>
-      <kbd>Del</kbd> delete shape &middot; <kbd>[</kbd> <kbd>]</kbd> send back/forward<br>
+      <kbd>Del</kbd> delete shape &middot; <kbd>[</kbd> <kbd>]</kbd> send back/forward &middot; <kbd>D</kbd> dye<br>
       <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo &middot; <kbd>Esc</kbd> cancel<br>
       wheel zoom &middot; middle-drag or arrows pan &middot; <kbd>Alt</kbd>+wheel vertical scale &middot; <kbd>0</kbd> fit
       <span id="help-site"></span>
@@ -229,12 +232,14 @@ function contains(sh, x, z) {
 // ───────── raster ─────────
 function rasterize() {
   const { nx, nz, dx } = GRID, N = nx * nz;
-  if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), p4: new Float32Array(N), cls: new Uint8Array(N) };
-  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.p4.fill(0); R.cls.fill(0); R.comp = null; R.tdep = null;
+  if (!RASTER || RASTER.nx !== nx || RASTER.nz !== nz) RASTER = { nx, nz, dx, mat: new Uint8Array(N), p1: new Float32Array(N), p2: new Float32Array(N), p3: new Float32Array(N), p4: new Float32Array(N), cls: new Uint8Array(N), frac: new Float32Array(N) };
+  const R = RASTER; R.dx = dx; R.mat.fill(0); R.p1.fill(0); R.p2.fill(0); R.p3.fill(0); R.p4.fill(0); R.cls.fill(0); R.frac.fill(0); R.comp = null; R.tdep = null;
   // the bed: everything under the profile is sediment of the bed's class
   for (let i = 0; i < nx; i++) {
     const zb = bedZ((i + 0.5) * dx), kb = Math.min(nz, Math.round(zb / dx));
     for (let k = 0; k < kb; k++) { const c = i + nx * k; R.mat[c] = MAT.SEDIMENT; R.cls[c] = scene.bed.cls; }
+    // drawing only: how much of each cell the bed covers (the model uses whole cells)
+    for (let k = 0; k < nz; k++) { const fr = (zb - k * dx) / dx; if (fr <= 0) break; R.frac[i + nx * k] = Math.min(1, fr); }
   }
   // shapes, in order: later shapes cover earlier ones; the eraser writes water. Plants and
   // porous rock only take water cells: they stand on the bed and on solids, never replace them.
@@ -243,8 +248,14 @@ function rasterize() {
     const b = bboxOf(sh);
     const i0 = Math.max(0, Math.floor(b.x0 / dx - 0.5)), i1 = Math.min(nx - 1, Math.ceil(b.x1 / dx - 0.5));
     const k0 = Math.max(0, Math.floor(b.z0 / dx - 0.5)), k1 = Math.min(nz - 1, Math.ceil(b.z1 / dx - 0.5));
-    const pr = sh.props || {};
+    const pr = sh.props || {}, opaque = sh.mat === MAT.SOLID || sh.mat === MAT.SEDIMENT, eraser = sh.mat === MAT.FLUID;
     for (let k = k0; k <= k1; k++) for (let i = i0; i <= i1; i++) {
+      // drawing only: the fraction of the cell the shape covers (3 x 3 samples)
+      if (opaque || eraser) {
+        let cov = 0; for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) if (contains(sh, (i + (a + 0.5) / 3) * dx, (k + (b + 0.5) / 3) * dx)) cov++;
+        cov /= 9; const cc = i + nx * k;
+        if (opaque) R.frac[cc] = Math.max(R.frac[cc], cov); else R.frac[cc] = Math.min(R.frac[cc], 1 - cov);
+      }
       if (!contains(sh, (i + 0.5) * dx, (k + 0.5) * dx)) continue;
       const c = i + nx * k;
       if (onlyWater && (R.mat[c] === MAT.SOLID || R.mat[c] === MAT.SEDIMENT)) continue;
@@ -319,17 +330,38 @@ const BAND_PERIOD = 120;     // seconds of bed time per stratigraphy band
 function bedChanged(b) {
   if (!RASTER || !b || !b.mat || b.mat.length !== RASTER.mat.length) return;
   RASTER.mat.set(b.mat); RASTER.comp = b.comp || null; RASTER.tdep = b.tdep || null;
+  // the moving bed's continuous height gives the drawn coverage in the erodible zone of each column
+  if (b.zs && b.zfix) {
+    const { nx, nz, dx } = GRID;
+    for (let i = 0; i < nx; i++) {
+      const zs = b.zs[i], zf = b.zfix[i]; if (zs < 0) continue;
+      for (let k = Math.floor(zf / dx + 1e-6); k < nz; k++) {
+        const c = i + nx * k, fr = Math.max(0, Math.min(1, (zs - k * dx) / dx));
+        if (k * dx >= zs && RASTER.mat[c] !== MAT.SOLID && RASTER.mat[c] !== MAT.SEDIMENT) break;
+        if (RASTER.mat[c] === MAT.SOLID) break;
+        RASTER.frac[c] = fr;
+      }
+    }
+  }
   buildMatImage(); buildStems();
 }
 function hash2(i, k) { const s = Math.sin(i * 127.1 + k * 311.7) * 43758.5453; return s - Math.floor(s); }
+// The image is drawn at UX x UZ pixels per cell. Solids and sediment get smooth outlines: a pixel is
+// solid where the bilinear blend of the four nearest cells' solidness is at least one half (a contour
+// between cell centres), so beds and shapes read as lines, not stairs, under vertical exaggeration.
+let matUX = 1, matUZ = 1;
 function buildMatImage() {
-  const { nx, nz } = GRID;
+  const { nx, nz } = GRID, R = RASTER;
+  const UX = 2, UZ = Math.max(1, Math.min(6, Math.floor(4e6 / (nx * nz * UX)))), W = nx * UX, H = nz * UZ;
+  matUX = UX; matUZ = UZ;
   if (!matCanvas) { matCanvas = document.createElement('canvas'); }
-  if (matCanvas.width !== nx || matCanvas.height !== nz) { matCanvas.width = nx; matCanvas.height = nz; }
+  if (matCanvas.width !== W || matCanvas.height !== H) { matCanvas.width = W; matCanvas.height = H; }
   matCtx = matCanvas.getContext('2d', { willReadFrequently: true });   // a CPU canvas: a GPU reset cannot wipe it
-  const img = matCtx.createImageData(nx, nz), d = img.data, R = RASTER;
+  const cellRGBA = new Uint8ClampedArray(4 * nx * nz), opq = new Float32Array(nx * nz), isSolid = new Uint8Array(nx * nz);
   for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) {
-    const c = i + nx * k, o = 4 * (i + nx * (nz - 1 - k)), m = R.mat[c];
+    const c = i + nx * k, o = 4 * c, m = R.mat[c];
+    isSolid[c] = (m === MAT.SOLID || m === MAT.SEDIMENT) ? 1 : 0;
+    opq[c] = R.frac ? R.frac[c] : isSolid[c];
     let r = 0, g = 0, b = 0, a = 0;
     if (m === MAT.SOLID) { const n = (hash2(i, k) - 0.5) * 10; r = 74 + n; g = 80 + n; b = 89 + n; a = 255; }
     else if (m === MAT.SEDIMENT) {
@@ -350,7 +382,32 @@ function buildMatImage() {
       if (q > (R.p1[c] || 0.4)) { const n = (q - 0.5) * 40 + (hash2(i, k) - 0.5) * 10; r = 128 + n; g = 118 + n; b = 104 + n; a = 240; }
       else { r = 30; g = 40; b = 46; a = 60; }
     } else if (m === MAT.CANOPY) { r = 70; g = 150; b = 80; a = 30; }
-    d[o] = r; d[o + 1] = g; d[o + 2] = b; d[o + 3] = a;
+    cellRGBA[o] = r; cellRGBA[o + 1] = g; cellRGBA[o + 2] = b; cellRGBA[o + 3] = a;
+  }
+  const img = matCtx.createImageData(W, H), d = img.data;
+  for (let py = 0; py < H; py++) {
+    const fz = (H - 1 - py + 0.5) / UZ - 0.5, k0 = Math.max(0, Math.min(nz - 1, Math.floor(fz))), k1 = Math.min(nz - 1, k0 + 1), bz = Math.max(0, Math.min(1, fz - k0));
+    const kc = Math.max(0, Math.min(nz - 1, Math.floor((H - 1 - py + 0.5) / UZ)));
+    for (let px = 0; px < W; px++) {
+      const fx = (px + 0.5) / UX - 0.5, i0 = Math.max(0, Math.min(nx - 1, Math.floor(fx))), i1 = Math.min(nx - 1, i0 + 1), ax = Math.max(0, Math.min(1, fx - i0));
+      const c00 = i0 + nx * k0, c10 = i1 + nx * k0, c01 = i0 + nx * k1, c11 = i1 + nx * k1;
+      const w00 = (1 - ax) * (1 - bz), w10 = ax * (1 - bz), w01 = (1 - ax) * bz, w11 = ax * bz;
+      const v = opq[c00] * w00 + opq[c10] * w10 + opq[c01] * w01 + opq[c11] * w11;
+      let src;
+      // coverage decides where the edge falls; the colour comes from a cell that is solid or sediment
+      // (above the edge) or one that is not (below it)
+      const own = Math.max(0, Math.min(nx - 1, Math.floor((px + 0.5) / UX))) + nx * kc;
+      if (v >= 0.5) {
+        let best = -1, bw = -1; for (const [cc, ww] of [[c00, w00], [c10, w10], [c01, w01], [c11, w11]]) if (isSolid[cc] && ww > bw) { bw = ww; best = cc; }
+        if (best < 0) { const below = own - nx; best = below >= 0 && isSolid[below] ? below : own; }
+        src = best;
+      } else {
+        if (isSolid[own]) { let best = -1, bw = -1; for (const [cc, ww] of [[c00, w00], [c10, w10], [c01, w01], [c11, w11]]) if (!isSolid[cc] && ww > bw) { bw = ww; best = cc; } src = best; }
+        else src = own;
+      }
+      const o = 4 * (px + W * py);
+      if (src >= 0) { const q = 4 * src; d[o] = cellRGBA[q]; d[o + 1] = cellRGBA[q + 1]; d[o + 2] = cellRGBA[q + 2]; d[o + 3] = cellRGBA[q + 3]; }
+    }
   }
   matCtx.putImageData(img, 0, 0);
 }
@@ -499,7 +556,7 @@ function drawUI(now) {
   const c = uiCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, view.cw, view.ch);
   const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
   // materials
-  c.imageSmoothingEnabled = view.s * GRID.dx < 2.5;
+  c.imageSmoothingEnabled = view.s * GRID.dx < 2.5 / matUX;
   if (matCanvas) c.drawImage(matCanvas, X0, Y0, X1 - X0, Y1 - Y0);
   // plant stems
   if (stems.length) {
@@ -632,6 +689,7 @@ function onDown(e) {
     if (polyPts.length >= 3) { const [Xf, Yf] = w2s(polyPts[0][0], polyPts[0][1]); if (Math.hypot(X - Xf, Y - Yf) < 8) { finishPoly(); return; } }
     polyPts.push([x, z]); return;
   }
+  if (tool === 'dye') { drag = { kind: 'dye', x, z }; if (model && model.injectDye) model.injectDye(x, z, Math.max(brushW() / 2, GRID.dx)); return; }
   if (tool === 'gauge') {
     const g = gaugeAt(X);
     if (g) { pushUndo(); drag = { kind: 'gauge', g }; return; }
@@ -671,6 +729,10 @@ function onMove(e) {
   if (drag.kind === 'stroke') { const p = drag.preview.pts, last = p[p.length - 1]; if (Math.hypot((x - last[0]) * view.s, (z - last[1]) * view.s * view.ve) > 3) p.push([x, z]); return; }
   if (drag.kind === 'line' || drag.kind === 'box') { drag.preview.pts[1] = [x, z]; return; }
   if (drag.kind === 'gauge') { drag.g.x = +clampX(x).toFixed(4); gaugeData.delete(drag.g.id); return; }
+  if (drag.kind === 'dye') {
+    if (Math.hypot((x - drag.x) * view.s, (z - drag.z) * view.s * view.ve) > 4 && model && model.injectDye) { model.injectDye(x, z, Math.max(brushW() / 2, GRID.dx)); drag.x = x; drag.z = z; }
+    return;
+  }
   if (drag.kind === 'bed') {
     const p = scene.bed.pts, j = drag.j, last = p.length - 1;
     const xn = j === 0 ? 0 : j === last ? DOMAIN.L : Math.max(p[j - 1][0] + GRID.dx, Math.min(p[j + 1][0] - GRID.dx, x));
@@ -683,6 +745,7 @@ function onUp() {
   if (d.kind === 'move') { if (d.moved) sceneChanged(); else undoStack.pop(); return; }
   if (d.kind === 'resize' || d.kind === 'bed') { sceneChanged(); return; }
   if (d.kind === 'gauge') { saveLocal(); return; }
+  if (d.kind === 'dye') return;
   if (d.kind === 'stroke' || d.kind === 'line' || d.kind === 'box') {
     const pv = d.preview, b = bboxOf(pv);
     if (d.kind === 'box' && (Math.abs(b.x1 - b.x0) * view.s < 3 || Math.abs(b.z1 - b.z0) * view.s * view.ve < 3)) return;
@@ -835,6 +898,7 @@ const HINTS = {
   // plants and porous rock fill water only; see rasterize()
   bed: 'Drag a point to reshape the bed. Click the line to add a point, right-click a point to remove it.',
   gauge: 'Click to place a water-level gauge. Drag one to move it, right-click to remove it.',
+  dye: 'Click or drag in the water to release dye. It is carried by the flow.',
 };
 function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
 
@@ -853,6 +917,50 @@ function updateStats(now) {
   document.getElementById('stats').innerHTML = rows.map(([a, b]) => `<div class="row"><span>${a}</span><span>${b}</span></div>`).join('');
 }
 
+// ───────── stills and video ─────────
+// The view is three stacked canvases (and the gauge chart); a still or a video frame draws them into
+// one canvas, right after the frame is rendered (a WebGPU canvas can be read only in that frame).
+let stillPending = false, recorder = null, recCanvas = null, recChunks = [];
+function composite(target) {
+  const r = view.dpr || 1, W = Math.round(view.cw * r), H = Math.round(view.ch * r);
+  if (target.width !== W || target.height !== H) { target.width = W; target.height = H; }
+  const c = target.getContext('2d'); c.fillStyle = '#0d1116'; c.fillRect(0, 0, W, H);
+  for (const cv of [cvBg, cvGpu, cvUi]) c.drawImage(cv, 0, 0, W, H);
+  const panel = document.getElementById('gauges');
+  if (!panel.hidden && gaugeCv) {
+    const st = document.getElementById('stage').getBoundingClientRect(), pb = panel.getBoundingClientRect(), gb = gaugeCv.getBoundingClientRect();
+    c.fillStyle = 'rgba(21, 27, 34, 0.92)'; c.fillRect((pb.left - st.left) * r, (pb.top - st.top) * r, pb.width * r, pb.height * r);
+    c.drawImage(gaugeCv, (gb.left - st.left) * r, (gb.top - st.top) * r, gb.width * r, gb.height * r);
+  }
+  return target;
+}
+function saveStill() { stillPending = true; }
+function toggleRecord() {
+  const btn = document.getElementById('record');
+  if (recorder) { recorder.stop(); return; }
+  if (typeof MediaRecorder === 'undefined') { showNote('This browser cannot record video.'); return; }
+  recCanvas = recCanvas || document.createElement('canvas'); composite(recCanvas);
+  const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
+  recChunks = [];
+  recorder = new MediaRecorder(recCanvas.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: 12e6 } : undefined);
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onstop = () => {
+    const ext = (recorder.mimeType || '').includes('mp4') ? 'mp4' : 'webm';
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(recChunks, { type: recorder.mimeType || 'video/webm' })); a.download = 'flume.' + ext;
+    document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    recorder = null; btn.textContent = 'record video'; btn.classList.remove('primary');
+  };
+  recorder.start(1000); btn.textContent = 'stop recording'; btn.classList.add('primary');
+}
+function afterRender() {
+  if (stillPending) {
+    stillPending = false;
+    const cv = composite(document.createElement('canvas'));
+    cv.toBlob((b) => { if (!b) return; const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'flume.png'; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); }, 'image/png');
+  }
+  if (recorder && recCanvas) composite(recCanvas);
+}
+
 // ───────── loop ─────────
 function frame(now) {
   const dt = lastFrame ? (now - lastFrame) / 1000 : 0; lastFrame = now;
@@ -863,6 +971,7 @@ function frame(now) {
   if (model) model.render(view);
   drawUI(now);
   drawGauges();
+  afterRender();
   for (const b of backends) if (b.frame) b.frame();
   updateStats(now);
   requestAnimationFrame(frame);
@@ -875,6 +984,7 @@ function onKey(e) {
   if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')) { e.preventDefault(); undo(); return; }
   if (k === ' ') { e.preventDefault(); setRunning(!running); return; }
   if (k === 'r' || k === 'R') { restart(); return; }
+  if (k === 'd' || k === 'D') { setTool('dye'); return; }
   if (k >= '1' && k <= '9') { setTool(['select', 'brush', 'line', 'poly', 'rect', 'ellipse', 'erase', 'bed', 'gauge'][+k - 1]); return; }
   if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
   if (k === 'Escape') { polyPts = null; drag = null; selected = null; updatePanel(); return; }
@@ -924,6 +1034,9 @@ function wire() {
   $('restart').addEventListener('click', restart);
   $('speed').addEventListener('change', (e) => { if (model && model.p) model.p.speed = +e.target.value; });
   $('undo').addEventListener('click', undo);
+  $('still').addEventListener('click', saveStill);
+  $('record').addEventListener('click', toggleRecord);
+  $('clear-dye').addEventListener('click', () => { if (model && model.clearDye) model.clearDye(); });
   $('save').addEventListener('click', () => download('scene.json', sceneFileText()));
   $('open').addEventListener('click', () => $('open-file').click());
   $('open-file').addEventListener('change', (e) => {
@@ -960,6 +1073,7 @@ function wire() {
 //     surfaceSample() -> { t, eta, dx },   // optional: the latest surface height per column (m;
 //                                          // negative where a column has no water), at model time t
 //     gaugeWindow() -> seconds,            // optional: window for the gauges' wave height
+//     injectDye(x, z, r), clearDye(),      // optional: the dye tool
 //     plantSample() -> { le, dir },        // optional: per column, plants' effective length / length
 //                                          // (1 upright) and the flow direction (-1, 0, 1), for drawing
 //   });

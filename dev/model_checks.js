@@ -375,6 +375,18 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('a flexible meadow resists less than the same meadow rigid', drops[2e-5] > 0 && drops[2e-5] < 0.9 * drops[1e6], 'head drop ' + (drops[2e-5] * 1000).toFixed(1) + ' mm flexible vs ' + (drops[1e6] * 1000).toFixed(1) + ' mm rigid, bent to ' + (100 * rGPU).toFixed(0) + '% of its length');
   }
 
+  // 22. dye: released in a closed wave flume, carried by the waves, and its total kept
+  if (want('dye')) {
+    const rr = flume(10, 0.8, dx, (x, z) => (z < 0.04 ? 1 : 0));
+    await setup(rr, { type: 'wave', h0: 0.42, H: 0.08, T: 1.8, farEnd: 'wall', absorb: true });
+    M.injectDye(3, 0.3, 0.08);
+    const N = rr.nx * rr.nz, total = async () => { const d2 = await M.debug.read('dye'); let m = 0, mx = 0, cx = 0; for (let c = 0; c < N; c++) { m += d2[c]; cx += d2[c] * ((c % rr.nx) + 0.5) * dx; } return { m, cx: cx / m }; };
+    const a = await total(); await M.debug.steps(Math.round(15 / stepFor(dx, 1.0)), stepFor(dx, 1.0)); const b = await total();
+    check('dye is carried by the flow and its total is kept (within 1% over 15 s)', a.m > 0 && Math.abs(b.m / a.m - 1) < 0.01, 'total ' + (100 * (b.m / a.m - 1)).toFixed(3) + '%, centre moved ' + ((b.cx - a.cx) * 100).toFixed(1) + ' cm');
+    const rerr2 = await M.debug.validateRender(400, 200);
+    check('the water renderer (with dye, plumes and foam) builds and draws', !rerr2, rerr2);
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
