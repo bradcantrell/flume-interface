@@ -75,7 +75,7 @@ vm.createContext(sandbox);
 
 // ───────── stub model ─────────
 const STUB = `
-const calls = { init: 0, setGrid: 0, setRaster: 0, reset: 0, frame: 0, framesRunning: 0, render: 0, setScale: [] };
+const calls = { watch: [], init: 0, setGrid: 0, setRaster: 0, reset: 0, frame: 0, framesRunning: 0, render: 0, setScale: [] };
 registerModel({
   id: 'stub', calls, p: { speed: 1 },
   async init(api) { calls.init++; calls.api = api; return { ok: false, reason: 'stub model' }; },
@@ -87,6 +87,9 @@ registerModel({
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
   render(v) { calls.render++; calls.view = v; },
   readouts() { return [['stub', 'ok']]; },
+  watchSurface(on) { calls.watch.push(on); },
+  surfaceSample() { return calls.sample || null; },
+  gaugeWindow() { return 10; },
   state() { return { stubState: 7 }; }, setState(s) { calls.state = s; },
   controls: { html: '<div class="row"><label for="stub-x">x</label><input id="stub-x" type="number"></div>' },
 });`;
@@ -241,6 +244,31 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('R restarts the model', C.reset === rs + 1);
   check('keys typed into a number box are not taken as shortcuts', (T.onKey({ key: ' ', target: { tagName: 'INPUT' }, preventDefault() {} }), T.running === false));
   check('the render view carries the device pixel ratio', C.view && C.view.dpr === 1 && C.view.cw === W);
+
+  // 11. gauges
+  T.setTool('gauge');
+  const ng = run('scene.gauges.length'), [Xg, Yg] = T.w2s(5, 0.5);
+  T.onDown({ offsetX: Xg, offsetY: Yg, button: 0 });
+  check('the gauge tool places a gauge where clicked', run('scene.gauges.length') === ng + 1 && Math.abs(run('scene.gauges[scene.gauges.length - 1].x') - 5) < 0.05);
+  T.onDown({ offsetX: Xg + 2, offsetY: Yg + 30, button: 0 }); T.onMove({ offsetX: T.w2s(7, 0.5)[0], offsetY: Yg }); T.onUp({});
+  check('a gauge can be dragged along the flume, not duplicated', run('scene.gauges.length') === ng + 1 && Math.abs(run('scene.gauges[scene.gauges.length - 1].x') - 7) < 0.05);
+  T.onDown({ offsetX: Xg, offsetY: Yg, button: 0 });     // a second gauge at 5 m
+  // feed a sine wave (H = 4 cm, T = 2 s) at both gauges, the second at half height
+  const nx = 100, eta = new Float32Array(nx);
+  for (let n = 0; n <= 400; n++) {
+    const t = n * 0.05;
+    for (let i = 0; i < nx; i++) { const x = (i + 0.5) * 0.2; eta[i] = 0.4 + (x < 6 ? 0.02 : 0.01) * Math.sin(2 * Math.PI * t / 2); }
+    C.sample = { t, eta: Float32Array.from(eta), dx: 0.2 };
+    run('sampleGauges()');
+  }
+  run('frame(5000)');
+  const legend = getEl('gauge-legend').innerHTML;
+  check('the model is asked to watch the surface while gauges exist', C.watch[C.watch.length - 1] === true);
+  check('the panel shows each gauge with its mean level and wave height', /G1<\/b> at 7 m · mean 0\.4 m · H 2 cm/.test(legend) && /G2<\/b> at 5 m · mean 0\.4 m · H 4 cm/.test(legend), legend.replace(/<[^>]+>/g, '').slice(0, 160));
+  check('and the wave height relative to the first gauge (transmission)', /×2\.00/.test(legend));
+  const saved = T.sceneFileText();
+  check('gauges are saved with the scene and come back', /"gauges"/.test(saved) && T.openSceneText(saved) && run('scene.gauges.length') === ng + 2);
+  check('a right-click removes a gauge', (T.setTool('gauge'), T.onDown({ offsetX: T.w2s(5, 0.5)[0], offsetY: Yg, button: 2 }), run('scene.gauges.length') === ng + 1));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

@@ -43,6 +43,16 @@
   #keys { color: var(--dim); font-size: 12px; margin-top: 14px; line-height: 1.6; }
   kbd { background: var(--panel2); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: 11px ui-monospace, monospace; color: var(--text); }
   .note { color: var(--dim); font-size: 12px; margin: 4px 0; }
+  #gauges { position: absolute; left: 12px; bottom: 34px; width: min(520px, calc(100% - 24px)); padding: 8px 10px 6px; border-radius: 8px;
+    background: rgba(21, 27, 34, 0.92); border: 1px solid var(--line); z-index: 4; }
+  #gauges[hidden] { display: none; }
+  #gauge-cv { width: 100%; height: 110px; display: block; cursor: crosshair; }
+  #gauge-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #gauge-legend b { color: var(--text); font-weight: 600; }
+  #gauge-legend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 5px; }
+  #gauge-tip { position: absolute; pointer-events: none; background: #0d1116; border: 1px solid var(--line); border-radius: 5px; padding: 4px 7px;
+    font-size: 11px; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #gauge-tip[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -60,9 +70,11 @@
       <button data-tool="rect" title="Rectangle (5)"><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="10" rx="1"/></svg></button>
       <button data-tool="ellipse" title="Ellipse (6)"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="5.5"/></svg></button>
       <button data-tool="erase" title="Eraser, carves water (7)"><svg viewBox="0 0 24 24"><path d="M8 20h12M5 15l8-9 6 6-8 8H9z"/></svg></button>
+      <button data-tool="gauge" title="Water-level gauge (9)"><svg viewBox="0 0 24 24"><path d="M12 3v18M8 7h8M9 11h6M8 15h8"/></svg></button>
       <button data-tool="bed" title="Edit the bed profile (8)"><svg viewBox="0 0 24 24"><path d="M3 16c4-5 6 1 9-3s5-1 9-4"/><circle cx="12" cy="13" r="1.6"/></svg></button>
     </div>
     <div id="hint"></div>
+    <div id="gauges" hidden><canvas id="gauge-cv"></canvas><div id="gauge-legend"></div><div id="gauge-tip" hidden></div></div>
   </div>
   <aside>
     <h1>Flume Interface</h1>
@@ -103,7 +115,7 @@
     <div id="stats"></div>
 
     <div id="keys">
-      <kbd>Space</kbd> run/pause &middot; <kbd>R</kbd> restart &middot; <kbd>1</kbd>–<kbd>8</kbd> tools<br>
+      <kbd>Space</kbd> run/pause &middot; <kbd>R</kbd> restart &middot; <kbd>1</kbd>–<kbd>9</kbd> tools<br>
       <kbd>Del</kbd> delete shape &middot; <kbd>[</kbd> <kbd>]</kbd> send back/forward<br>
       <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo &middot; <kbd>Esc</kbd> cancel<br>
       wheel zoom &middot; middle-drag or arrows pan &middot; <kbd>Alt</kbd>+wheel vertical scale &middot; <kbd>0</kbd> fit
@@ -162,7 +174,7 @@ function gridFor(dom) {
 // ───────── scene ─────────
 // shapes: { id, kind: 'rect'|'ellipse'|'poly'|'stroke', pts: [[x,z],...], w (stroke width, m),
 //           mat, props: {...} }. rect and ellipse keep two corner points.
-let scene = { bed: { pts: [[0, 0.1], [20, 0.1]], cls: 0 }, shapes: [] };
+let scene = { bed: { pts: [[0, 0.1], [20, 0.1]], cls: 0 }, shapes: [], gauges: [] };
 let nextId = 1;
 
 function defaultBed(dom) { const z = +(dom.H * 0.1).toFixed(4); return { pts: [[0, z], [dom.L, z]], cls: 0 }; }
@@ -283,11 +295,11 @@ let lastFrame = 0;
 const STORE_KEY = 'flume-interface-scene';
 
 function shapeById(id) { return scene.shapes.find(s => s.id === id) || null; }
-function snapshot() { return JSON.stringify({ bed: scene.bed, shapes: scene.shapes }); }
+function snapshot() { return JSON.stringify({ bed: scene.bed, shapes: scene.shapes, gauges: scene.gauges }); }
 function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 80) undoStack.shift(); }
 function undo() {
   if (!undoStack.length) return;
-  const s = JSON.parse(undoStack.pop()); scene.bed = s.bed; scene.shapes = s.shapes;
+  const s = JSON.parse(undoStack.pop()); scene.bed = s.bed; scene.shapes = s.shapes; scene.gauges = s.gauges || [];
   if (selected && !shapeById(selected)) selected = null;
   sceneChanged();
 }
@@ -350,6 +362,97 @@ function buildStems() {
     }
   }
 }
+
+// ───────── gauges ─────────
+// Water-level gauges at fixed x. Each keeps the last 60 s of model time; the panel shows the
+// series, the mean level, the wave height (mean crest-to-trough over the model's gauge window),
+// and with two or more gauges each one's wave height over the first one's (transmission).
+const GAUGE_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#9085e9'];   // validated on the panel surface
+const GAUGE_KEEP = 60;
+let gaugeData = new Map(), gaugeLastT = -1, nextGaugeId = 1;
+function gaugeColor(g) { return GAUGE_COLORS[(scene.gauges.indexOf(g)) % GAUGE_COLORS.length]; }
+function clearGaugeData() { gaugeData = new Map(); gaugeLastT = -1; }
+function sampleGauges() {
+  if (!scene.gauges.length || !model || !model.surfaceSample) return;
+  const s = model.surfaceSample(); if (!s || !(s.t > gaugeLastT)) return;
+  if (s.t < gaugeLastT) clearGaugeData();
+  gaugeLastT = s.t;
+  for (const g of scene.gauges) {
+    const fi = g.x / s.dx - 0.5, i0 = Math.max(0, Math.min(s.eta.length - 1, Math.floor(fi))), i1 = Math.min(s.eta.length - 1, i0 + 1), a = Math.max(0, Math.min(1, fi - i0));
+    const e0 = s.eta[i0], e1 = s.eta[i1]; const e = e0 < 0 ? e1 : e1 < 0 ? e0 : e0 + a * (e1 - e0);
+    if (!(e >= 0)) continue;
+    let d = gaugeData.get(g.id); if (!d) gaugeData.set(g.id, d = { t: [], e: [] });
+    d.t.push(s.t); d.e.push(e);
+    while (d.t.length && d.t[0] < s.t - GAUGE_KEEP) { d.t.shift(); d.e.shift(); }
+  }
+}
+// mean level and mean wave height (crest minus trough per zero-up-crossing wave) over the window
+function gaugeStats(d, win) {
+  if (!d || d.t.length < 3) return null;
+  const tEnd = d.t[d.t.length - 1]; let j0 = 0; while (j0 < d.t.length - 1 && d.t[j0] < tEnd - win) j0++;
+  const e = d.e.slice(j0); if (e.length < 3) return null;
+  const mean = e.reduce((a, b) => a + b, 0) / e.length;
+  const up = []; for (let j = 1; j < e.length; j++) if (e[j - 1] < mean && e[j] >= mean) up.push(j);
+  let H = 0;
+  if (up.length >= 2) { let sum = 0; for (let w = 1; w < up.length; w++) { let hi = -Infinity, lo = Infinity; for (let j = up[w - 1]; j < up[w]; j++) { hi = Math.max(hi, e[j]); lo = Math.min(lo, e[j]); } sum += hi - lo; } H = sum / (up.length - 1); }
+  else H = Math.max(...e) - Math.min(...e);
+  return { mean, H };
+}
+let gaugeCv = null, gaugeHover = null;
+function drawGauges() {
+  const panel = document.getElementById('gauges');
+  if (!scene.gauges.length) { if (!panel.hidden) panel.hidden = true; return; }
+  if (panel.hidden) panel.hidden = false;
+  const cv = gaugeCv || (gaugeCv = document.getElementById('gauge-cv')), r = view.dpr || 1;
+  const box = cv.getBoundingClientRect(), W = Math.max(200, box.width), H = Math.max(60, box.height);
+  if (cv.width !== Math.round(W * r) || cv.height !== Math.round(H * r)) { cv.width = Math.round(W * r); cv.height = Math.round(H * r); }
+  const c = cv.getContext('2d'); c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, W, H);
+  const span = 30, padL = 46, padR = 28, padT = 6, padB = 16;
+  let tEnd = gaugeLastT > 0 ? gaugeLastT : span, lo = Infinity, hi = -Infinity;
+  for (const g of scene.gauges) { const d = gaugeData.get(g.id); if (d) for (let j = 0; j < d.t.length; j++) if (d.t[j] >= tEnd - span) { lo = Math.min(lo, d.e[j]); hi = Math.max(hi, d.e[j]); } }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  const padZ = Math.max((hi - lo) * 0.15, 0.002); lo -= padZ; hi += padZ;
+  const X = (t) => padL + (t - (tEnd - span)) / span * (W - padL - padR), Y = (e) => padT + (hi - e) / (hi - lo) * (H - padT - padB);
+  // recessive grid and axis labels
+  c.strokeStyle = 'rgba(160,190,215,0.10)'; c.lineWidth = 1; c.fillStyle = 'rgba(135,150,165,0.95)'; c.font = '10px system-ui, sans-serif';
+  const ztick = niceStep((hi - lo) / 3);
+  c.textAlign = 'right';
+  for (let z = Math.ceil(lo / ztick) * ztick; z <= hi; z += ztick) { const y = Math.round(Y(z)) + 0.5; c.beginPath(); c.moveTo(padL, y); c.lineTo(W - padR, y); c.stroke(); c.fillText(fmtLen(z), padL - 4, y + 3); }
+  c.textAlign = 'center';
+  for (let t = Math.ceil((tEnd - span) / 10) * 10; t <= tEnd; t += 10) c.fillText(t.toFixed(0) + ' s', X(t), H - 3);
+  // series: 2 px lines, direct label at the right end
+  for (const g of scene.gauges) {
+    const d = gaugeData.get(g.id); if (!d || d.t.length < 2) continue;
+    c.strokeStyle = gaugeColor(g); c.lineWidth = 2; c.lineJoin = 'round'; c.beginPath(); let started = false;
+    for (let j = 0; j < d.t.length; j++) { if (d.t[j] < tEnd - span) continue; const x = X(d.t[j]), y = Y(d.e[j]); started ? c.lineTo(x, y) : c.moveTo(x, y); started = true; }
+    c.stroke();
+    c.fillStyle = 'rgba(215,222,230,0.95)'; c.textAlign = 'left'; c.fillText('G' + (scene.gauges.indexOf(g) + 1), W - padR + 4, Y(d.e[d.e.length - 1]) + 3);
+  }
+  // hover crosshair
+  if (gaugeHover !== null && gaugeHover >= padL && gaugeHover <= W - padR) {
+    c.strokeStyle = 'rgba(215,222,230,0.45)'; c.lineWidth = 1; c.beginPath(); c.moveTo(Math.round(gaugeHover) + 0.5, padT); c.lineTo(Math.round(gaugeHover) + 0.5, H - padB); c.stroke();
+  }
+  // legend with stats
+  const win = model && model.gaugeWindow ? model.gaugeWindow() : 10;
+  const st = scene.gauges.map(g => gaugeStats(gaugeData.get(g.id), win)), ref = st[0] && st[0].H > 0.0005 ? st[0].H : null;
+  const leg = scene.gauges.map((g, j) => {
+    const s2 = st[j]; const parts = s2 ? `mean ${fmtLevel(s2.mean)} · H ${fmtLen(s2.H)}${ref && j > 0 ? ' · ×' + (s2.H / ref).toFixed(2) : ''}` : 'waiting for data';
+    return `<span><i style="background:${gaugeColor(g)}"></i><b>G${j + 1}</b> at ${fmtLevel(g.x)} · ${parts}</span>`;
+  }).join('');
+  const el = document.getElementById('gauge-legend'); if (el._last !== leg) { el.innerHTML = leg; el._last = leg; }
+}
+function fmtLevel(m) { return (+m.toFixed(m < 10 ? 3 : 1)) + ' m'; }
+function gaugeTip(e) {
+  const cv = gaugeCv || document.getElementById('gauge-cv'), box = cv.getBoundingClientRect(), tip = document.getElementById('gauge-tip');
+  const x = e.offsetX, W = box.width, padL = 46, padR = 28, span = 30, tEnd = gaugeLastT > 0 ? gaugeLastT : span;
+  gaugeHover = x;
+  if (x < padL || x > W - padR || !gaugeData.size) { tip.hidden = true; return; }
+  const t = tEnd - span + (x - padL) / (W - padL - padR) * span;
+  const rows = scene.gauges.map((g, j) => { const d = gaugeData.get(g.id); if (!d || !d.t.length) return null; let k = 0; while (k < d.t.length - 1 && d.t[k] < t) k++; return `G${j + 1} ${fmtLevel(d.e[k])}`; }).filter(Boolean);
+  tip.textContent = t.toFixed(1) + ' s · ' + rows.join(' · ');
+  tip.hidden = false; tip.style.left = Math.min(x + 12, W - 160) + 'px'; tip.style.top = '6px';
+}
+function gaugeAt(X) { for (const g of scene.gauges) if (Math.abs(w2s(g.x, 0)[0] - X) < 7) return g; return null; }
 
 // ───────── drawing ─────────
 let bgCtx, uiCtx, cvBg, cvGpu, cvUi;
@@ -420,6 +523,14 @@ function drawUI(now) {
     const [X, Y] = w2s(hover[0], hover[1]); c.strokeStyle = tool === 'erase' ? 'rgba(120,210,235,0.9)' : 'rgba(242,193,78,0.9)'; c.lineWidth = 1;
     c.beginPath(); c.ellipse(X, Y, brushPx() / 2, brushPx() / 2 * view.ve, 0, 0, 6.2832); c.stroke();
   }
+  // gauges: a dashed line in the gauge's colour, its name, and the current level
+  for (const g of scene.gauges) {
+    const [Xg] = w2s(g.x, 0), col = gaugeColor(g);
+    c.save(); c.setLineDash([4, 4]); c.strokeStyle = col; c.lineWidth = 1.5; c.beginPath(); c.moveTo(Math.round(Xg) + 0.5, Y0); c.lineTo(Math.round(Xg) + 0.5, Y1); c.stroke(); c.restore();
+    c.fillStyle = 'rgba(215,222,230,0.95)'; c.font = '11px system-ui, sans-serif'; c.textAlign = 'center'; c.fillText('G' + (scene.gauges.indexOf(g) + 1), Xg, Y0 - 6);
+    const d = gaugeData.get(g.id);
+    if (d && d.e.length) { const [, Yl] = w2s(g.x, d.e[d.e.length - 1]); c.fillStyle = col; c.beginPath(); c.arc(Xg, Yl, 4, 0, 6.2832); c.fill(); c.strokeStyle = '#0d1116'; c.lineWidth = 1.5; c.stroke(); }
+  }
   drawScale(c);
 }
 function outline(c, sh, fill) {
@@ -474,6 +585,7 @@ function onDown(e) {
   if (e.button === 1 || (e.button === 0 && e.altKey && tool !== 'poly')) { drag = { kind: 'pan', X, Y, x0: view.x0, z0: view.z0 }; return; }
   if (e.button === 2) {
     if (tool === 'bed') bedDeleteNear(X, Y);
+    if (tool === 'gauge') { const g = gaugeAt(X); if (g) { pushUndo(); scene.gauges = scene.gauges.filter(q => q !== g); gaugeData.delete(g.id); saveLocal(); } }
     if (tool === 'poly') { polyPts = null; }
     return;
   }
@@ -494,6 +606,12 @@ function onDown(e) {
     if (!polyPts) polyPts = [];
     if (polyPts.length >= 3) { const [Xf, Yf] = w2s(polyPts[0][0], polyPts[0][1]); if (Math.hypot(X - Xf, Y - Yf) < 8) { finishPoly(); return; } }
     polyPts.push([x, z]); return;
+  }
+  if (tool === 'gauge') {
+    const g = gaugeAt(X);
+    if (g) { pushUndo(); drag = { kind: 'gauge', g }; return; }
+    if (x > 0 && x < DOMAIN.L) { pushUndo(); scene.gauges.push({ id: nextGaugeId++, x: +x.toFixed(4) }); saveLocal(); }
+    return;
   }
   if (tool === 'bed') {
     let best = -1, bd = 9;
@@ -527,6 +645,7 @@ function onMove(e) {
   }
   if (drag.kind === 'stroke') { const p = drag.preview.pts, last = p[p.length - 1]; if (Math.hypot((x - last[0]) * view.s, (z - last[1]) * view.s * view.ve) > 3) p.push([x, z]); return; }
   if (drag.kind === 'line' || drag.kind === 'box') { drag.preview.pts[1] = [x, z]; return; }
+  if (drag.kind === 'gauge') { drag.g.x = +clampX(x).toFixed(4); gaugeData.delete(drag.g.id); return; }
   if (drag.kind === 'bed') {
     const p = scene.bed.pts, j = drag.j, last = p.length - 1;
     const xn = j === 0 ? 0 : j === last ? DOMAIN.L : Math.max(p[j - 1][0] + GRID.dx, Math.min(p[j + 1][0] - GRID.dx, x));
@@ -538,6 +657,7 @@ function onUp() {
   const d = drag; drag = null;
   if (d.kind === 'move') { if (d.moved) sceneChanged(); else undoStack.pop(); return; }
   if (d.kind === 'resize' || d.kind === 'bed') { sceneChanged(); return; }
+  if (d.kind === 'gauge') { saveLocal(); return; }
   if (d.kind === 'stroke' || d.kind === 'line' || d.kind === 'box') {
     const pv = d.preview, b = bboxOf(pv);
     if (d.kind === 'box' && (Math.abs(b.x1 - b.x0) * view.s < 3 || Math.abs(b.z1 - b.z0) * view.s * view.ve < 3)) return;
@@ -587,7 +707,9 @@ function setDomain(next, stretch = true) {
     const fx = DOMAIN.L / old.L, fz = DOMAIN.H / old.H, fw = Math.sqrt(fx * fz);
     for (const sh of scene.shapes) { sh.pts = sh.pts.map(([x, z]) => [x * fx, z * fz]); if (sh.w) sh.w *= fw; }
     scene.bed.pts = scene.bed.pts.map(([x, z]) => [x * fx, z * fz]);
+    for (const g of scene.gauges) g.x *= fx;
   }
+  clearGaugeData();
   scene.bed.pts[0][0] = 0; scene.bed.pts[scene.bed.pts.length - 1][0] = DOMAIN.L;
   GRID = gridFor(DOMAIN);
   rasterize();
@@ -608,7 +730,7 @@ function propDefaultsFor(m, scale) { const s = DOMAIN.scale; DOMAIN.scale = scal
 
 // ───────── save / open ─────────
 function captureScene() {
-  return { app: 'flume-interface', version: 1, domain: DOMAIN, bed: scene.bed, shapes: scene.shapes, model: model && model.state ? model.state() : null };
+  return { app: 'flume-interface', version: 1, domain: DOMAIN, bed: scene.bed, shapes: scene.shapes, gauges: scene.gauges, model: model && model.state ? model.state() : null };
 }
 function sceneFileText() { return JSON.stringify(captureScene(), null, 1) + '\n'; }
 function validScene(s) {
@@ -621,11 +743,14 @@ function validScene(s) {
     for (const p of sh.pts) if (!Array.isArray(p) || !num(p[0]) || !num(p[1])) return false;
     if (![0, 1, 2, 3, 4].includes(sh.mat)) return false;
   }
+  if (s.gauges != null && (!Array.isArray(s.gauges) || s.gauges.some(g => !g || !num(g.x)))) return false;
   return true;
 }
 function applyScene(s) {
   if (!validScene(s)) return false;
-  scene = { bed: { pts: s.bed.pts.map(p => [p[0], p[1]]), cls: s.bed.cls | 0 }, shapes: s.shapes.map(sh => Object.assign({}, sh, { props: Object.assign({}, sh.props || {}) })) };
+  scene = { bed: { pts: s.bed.pts.map(p => [p[0], p[1]]), cls: s.bed.cls | 0 }, shapes: s.shapes.map(sh => Object.assign({}, sh, { props: Object.assign({}, sh.props || {}) })),
+    gauges: (s.gauges || []).map((g, j) => ({ id: g.id | 0 || j + 1, x: g.x })) };
+  nextGaugeId = scene.gauges.reduce((m, g) => Math.max(m, g.id + 1), 1); clearGaugeData();
   nextId = scene.shapes.reduce((m, sh) => Math.max(m, (sh.id | 0) + 1), 1);
   for (const sh of scene.shapes) if (!sh.id) sh.id = nextId++;
   selected = null; undoStack = [];
@@ -684,11 +809,12 @@ const HINTS = {
   erase: 'Drag to carve back to water. It cuts the bed too.',
   // plants and porous rock fill water only; see rasterize()
   bed: 'Drag a point to reshape the bed. Click the line to add a point, right-click a point to remove it.',
+  gauge: 'Click to place a water-level gauge. Drag one to move it, right-click to remove it.',
 };
 function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
 
 function setRunning(v) { running = !!v; document.getElementById('run').textContent = running ? 'pause' : 'run'; }
-function restart() { if (model && model.reset) model.reset(); }
+function restart() { if (model && model.reset) model.reset(); clearGaugeData(); }
 let statsAt = 0;
 function updateStats(now) {
   if (now - statsAt < 250) return; statsAt = now;
@@ -700,9 +826,12 @@ function updateStats(now) {
 function frame(now) {
   const dt = lastFrame ? (now - lastFrame) / 1000 : 0; lastFrame = now;
   if (model) model.frame(dt, running);
+  if (model && model.watchSurface) model.watchSurface(scene.gauges.length > 0);
+  sampleGauges();
   drawBackground();
   if (model) model.render(view);
   drawUI(now);
+  drawGauges();
   for (const b of backends) if (b.frame) b.frame();
   updateStats(now);
   requestAnimationFrame(frame);
@@ -715,7 +844,7 @@ function onKey(e) {
   if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')) { e.preventDefault(); undo(); return; }
   if (k === ' ') { e.preventDefault(); setRunning(!running); return; }
   if (k === 'r' || k === 'R') { restart(); return; }
-  if (k >= '1' && k <= '8') { setTool(['select', 'brush', 'line', 'poly', 'rect', 'ellipse', 'erase', 'bed'][+k - 1]); return; }
+  if (k >= '1' && k <= '9') { setTool(['select', 'brush', 'line', 'poly', 'rect', 'ellipse', 'erase', 'bed', 'gauge'][+k - 1]); return; }
   if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
   if (k === 'Escape') { polyPts = null; drag = null; selected = null; updatePanel(); return; }
   if (k === 'Enter') { finishPoly(); return; }
@@ -770,7 +899,10 @@ function wire() {
     const f = e.target.files && e.target.files[0]; if (!f) return;
     f.text().then((t) => { if (!openSceneText(t)) alert('That file is not a flume scene.'); e.target.value = ''; });
   });
-  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); });
+  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.gauges = []; clearGaugeData(); scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); });
+  const gc = $('gauge-cv');
+  gc.addEventListener('pointermove', gaugeTip);
+  gc.addEventListener('pointerleave', () => { gaugeHover = null; $('gauge-tip').hidden = true; });
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -793,6 +925,10 @@ function wire() {
 //     state() / setState(obj),             // optional: saved with the scene
 //     controls: { html, wire() },          // optional: mounted into #model-controls
 //     keys: { k: fn },                     // optional
+//     watchSurface(on),                    // optional: gauges exist, keep surfaceSample() fresh
+//     surfaceSample() -> { t, eta, dx },   // optional: the latest surface height per column (m;
+//                                          // negative where a column has no water), at model time t
+//     gaugeWindow() -> seconds,            // optional: window for the gauges' wave height
 //   });
 //
 // The raster: nx x nz cells, index i + nx * k (k = 0 at the floor), cell size dx metres.

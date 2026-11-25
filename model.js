@@ -816,7 +816,7 @@ fn smp(i:i32, k:i32) -> f32 {
 
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
   M.reset = function () {
-    M.t = 0;
+    M.t = 0; M.etaHost = null;
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
     const h0 = M.p.h0;
@@ -913,7 +913,22 @@ fn smp(i:i32, k:i32) -> f32 {
       M.device.queue.onSubmittedWorkDone().then(() => { M.msStep = (performance.now() - t0) / n; M.busy = false; }, () => { M.busy = false; });
     }
     if (M.frameNo % 6 === 0 && !M.readBusy) readScalars();
+    if (M.watching && M.frameNo % 2 === 0 && !M.etaBusy) readSurface();
   };
+  // gauges: the surface height per column, read back every other frame while gauges exist
+  M.watchSurface = function (on) { M.watching = !!on; };
+  M.surfaceSample = function () { return M.etaHost || null; };
+  M.gaugeWindow = function () { return M.p.type === 'wave' ? Math.max(3 * (M.p.T || 2), 6) : 10; };
+  function readSurface() {
+    if (!M.S) return;
+    M.etaBusy = true; const t = M.t, n = M.grid.nx, B = M.S.B.eta;
+    const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const e = M.device.createCommandEncoder(); e.copyBufferToBuffer(B, 0, st, 0, B.size); M.device.queue.submit([e.finish()]);
+    st.mapAsync(GPUMapMode.READ).then(() => {
+      M.etaHost = { t, eta: new Float32Array(st.getMappedRange().slice(0, n * 4)), dx: M.grid.dx };
+      st.unmap(); st.destroy(); M.etaBusy = false;
+    }, () => { M.etaBusy = false; });
+  }
   function readScalars() {
     M.readBusy = true;
     const st = M.device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });

@@ -246,7 +246,16 @@ functions
         libs            ("libfieldFunctionObjects.so");
         locations       (${probes.join(' ')});
         alpha           alpha.water;
-    }
+    }${(o.gauges || []).length ? `
+
+    // the gauges placed in the browser, in their order (G1, G2, ...)
+    gauges
+    {
+        type            interfaceHeight;
+        libs            ("libfieldFunctionObjects.so");
+        locations       (${o.gauges.map(x => `(${num(x)} 0 ${num(t / 2)})`).join(' ')});
+        alpha           alpha.water;
+    }` : ''}
 }
 `;
     F['system/fvSchemes'] = head('dictionary', 'fvSchemes', 'system') + `ddtSchemes      { default Euler; }
@@ -356,7 +365,8 @@ Source OpenFOAM (12 or later), then
     ./Allrun
 
 The water surface height at 19 points along the flume is written every step to
-\`postProcessing/surface/0/height.dat\`. Open the case in ParaView with \`paraFoam\` or by opening an
+\`postProcessing/surface/0/height.dat\`${(o.gauges || []).length ? `, and at your ${o.gauges.length} gauge(s) (G1 first) to
+\`postProcessing/gauges/0/height.dat\`` : ''}. Open the case in ParaView with \`paraFoam\` or by opening an
 empty file named \`case.foam\`.
 
 ## How it matches the browser
@@ -417,7 +427,7 @@ if (typeof registerBackend === 'function') registerBackend({
       // auto: k-epsilon for a river, laminar for waves (choose k-epsilon when the waves break)
       let turbulence = document.getElementById('of-turb').value;
       if (turbulence === 'auto') turbulence = p.type === 'wave' ? 'laminar' : 'kEpsilon';
-      const F = FLUME_CASE.files({ grid: GRID, raster: RASTER, p, sx0, endTime: end, scale: DOMAIN.scale, sceneText: sceneFileText(), turbulence });
+      const F = FLUME_CASE.files({ grid: GRID, raster: RASTER, p, sx0, endTime: end, scale: DOMAIN.scale, sceneText: sceneFileText(), turbulence, gauges: scene.gauges.map(g => g.x) });
       const a = document.createElement('a'); a.href = URL.createObjectURL(FLUME_CASE.zip(F, 'flume-case')); a.download = 'flume-case.zip';
       document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
     });

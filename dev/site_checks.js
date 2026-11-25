@@ -20,7 +20,7 @@ const dx = 0.02, C = { L: 6, H: 0.4, paint: (x, z) => (z < 0.04 ? 4 : (x > 2 && 
 const r = raster(C, dx);
 for (let c = 0; c < r.mat.length; c++) { if (r.mat[c] === 2) { r.p1[c] = 0.45; r.p2[c] = 0.03; } if (r.mat[c] === 3) { r.p1[c] = 12; r.p2[c] = 1.2; r.p3[c] = 0.006; } }
 const p = { type: 'river', h0: 0.3, q: 0.02, hout: 0.25 };
-const F = FLUME_CASE.files({ grid: { nx: r.nx, nz: r.nz, dx }, raster: r, p, sx0: 5, endTime: 30, scale: 'lab', sceneText: '{"app":"flume-interface"}' });
+const F = FLUME_CASE.files({ grid: { nx: r.nx, nz: r.nz, dx }, raster: r, p, sx0: 5, endTime: 30, scale: 'lab', sceneText: '{"app":"flume-interface"}', gauges: [1.5, 4.25] });
 const need = ['Allrun', 'README.md', 'scene.json', 'system/blockMeshDict', 'system/controlDict', 'system/fvSchemes', 'system/fvSolution', 'system/setFieldsDict', 'system/fluidCells', 'system/cellZones',
   'constant/g', 'constant/fvModels', 'constant/momentumTransport', 'constant/phaseProperties', 'constant/physicalProperties.water', 'constant/physicalProperties.air', '0/U', '0/p_rgh', '0/alpha.water', '0/k', '0/epsilon', '0/nut'];
 const missing = need.filter(f => !(f in F));
@@ -51,6 +51,7 @@ check('Allrun cuts the solids out, installs the zones, sets the water, and runs'
 
 // wave case
 const rw = raster(CASES.wave, dx), Fw = FLUME_CASE.files({ grid: { nx: rw.nx, nz: rw.nz, dx }, raster: rw, p: CASES.wave.p, sx0: 16, endTime: 20, scale: 'lab' });
+check('gauges become their own OpenFOAM probe set, in order', /gauges\s*\{[\s\S]*?locations\s+\(\(1\.5 0 0\.01\) \(4\.25 0 0\.01\)\)/.test(F['system/controlDict']) && /postProcessing\/gauges/.test(F['README.md']));
 check('wave case: Airy waves at the inlet with the asked height and period, closed far end', Fw['0/U'].includes('waveVelocity') && /amplitude\s+table \(\(0 0\) \(3\.2 0\.03\)\);/.test(Fw['constant/waveProperties']) && /scale\s+constant 1;/.test(Fw['constant/waveProperties']) && /period\s+1\.6;/.test(Fw['constant/waveProperties']) && /outlet\s*\{\s*type wall;/.test(Fw['system/blockMeshDict']));
 check('wave case: damping over the sponge, from x = 16 m', /isotropicDamping[\s\S]*origin\s+\(16 0 0\)/.test(Fw['constant/fvModels']));
 check('turbulence: k-epsilon by default', /kEpsilon/.test(F['constant/momentumTransport']) && /kEpsilon/.test(Fw['constant/momentumTransport']));
