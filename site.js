@@ -88,6 +88,9 @@ boundary
     F['constant/phaseProperties'] = head('dictionary', 'phaseProperties', 'constant') + 'phases          (water air);\n\nsigma           0.07;\n';
     F['constant/physicalProperties.water'] = head('dictionary', 'physicalProperties.water', 'constant') + 'viscosityModel  constant;\n\nnu              1e-06;\n\nrho             1000;\n';
     F['constant/physicalProperties.air'] = head('dictionary', 'physicalProperties.air', 'constant') + 'viscosityModel  constant;\n\nnu              1.48e-05;\n\nrho             1;\n';
+    // k-epsilon with rough walls. For waves, OpenFOAM's tutorial runs laminar, but a laminar test with
+    // waves breaking over a bar never finished (the time step collapsed); k-epsilon damps waves
+    // somewhat (about 20% over 10 m in that test), so wave heights are on the low side.
     F['constant/momentumTransport'] = head('dictionary', 'momentumTransport', 'constant') + 'simulationType  RAS;\n\nRAS\n{\n    model           kEpsilon;\n    turbulence      on;\n    printCoeffs     on;\n}\n';
 
     // porosityForce: S = -(mu d + rho |U| f / 2) U, so d = A / nu and f = 2 B (model's A, B)

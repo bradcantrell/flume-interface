@@ -33,6 +33,8 @@ The model is checked against textbook hydraulics and against OpenFOAM runs of it
 | Porous block, head drop | 33.3 mm | 33.9 mm (OpenFOAM) |
 | Plant patch, head drop | 21.7 mm | 21.7 mm (half of Cd a u squared) |
 
+Waves over a submerged bar are still open. The exported OpenFOAM case (k-epsilon) makes waves about 20 to 30% lower than the browser, and a laminar run did not finish once the waves broke over the bar.
+
 ## Run it
 
 It is a static site with no build step. Serve the folder over http on localhost (WebGPU needs a
