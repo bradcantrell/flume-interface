@@ -13,7 +13,7 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
   #app { display: flex; height: 100%; }
-  #stage { position: relative; flex: 1; min-width: 0; overflow: hidden; background: radial-gradient(ellipse at 50% 40%, #16202a 0%, #0b0f14 75%); }
+  #stage { position: relative; flex: 1; min-width: 0; overflow: hidden; background: #000; }
   #stage > canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
   #ui { touch-action: none; }
   #banner { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); max-width: 640px; padding: 10px 14px; border-radius: 8px;
@@ -93,6 +93,7 @@
     <div class="row"><label for="scale">scale</label><select id="scale"><option value="lab">lab</option><option value="field">field</option></select></div>
     <div class="row"><label for="len">length (m)</label><input id="len" type="number" step="any" min="0.5"></div>
     <div class="row"><label for="hgt">height (m)</label><input id="hgt" type="number" step="any" min="0.05"></div>
+    <div class="row"><label for="grid">lab grid</label><select id="grid"><option value="0">off</option><option value="1">on</option></select></div>
     <div class="row"><label for="res">resolution</label><select id="res"><option value="draft">draft</option><option value="normal">normal</option><option value="fine">fine</option></select></div>
 
     <h2>Material</h2>
@@ -276,7 +277,7 @@ let viewFitted = true;
 function fitView() {
   const { L, H } = DOMAIN, cw = view.cw, ch = view.ch;
   const s = cw / (L * 1.04);
-  const ve = Math.max(1, Math.min(40, (ch * 0.62) / (H * s)));
+  const ve = Math.max(1, Math.min(3, (ch * 0.62) / (H * s)));     // at most 3: plants, dye and foam keep their shape
   view.s = s; view.ve = +ve.toFixed(ve < 10 ? 1 : 0);
   view.x0 = -0.02 * L; view.z0 = -(ch / (s * view.ve) - H) / 2;
   viewFitted = true;
@@ -539,12 +540,13 @@ function resize() {
 function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
 function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
 
+let showGrid = false;
 function drawBackground() {
-  const c = bgCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, view.cw, view.ch);
+  const c = bgCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0);
+  // pure black, so the water and particles carry the picture; a faint metric grid on request
+  c.fillStyle = '#000'; c.fillRect(0, 0, view.cw, view.ch);
+  if (!showGrid) return;
   const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
-  // the flume interior: dark glass with a faint metric grid
-  const gr = c.createLinearGradient(0, Y0, 0, Y1); gr.addColorStop(0, '#1a232c'); gr.addColorStop(1, '#121920');
-  c.fillStyle = gr; c.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
   c.save(); c.beginPath(); c.rect(X0, Y0, X1 - X0, Y1 - Y0); c.clip();
   const sx = niceStep(70 / view.s), sz = niceStep(50 / (view.s * view.ve));
   c.strokeStyle = 'rgba(160,190,215,0.06)'; c.lineWidth = 1; c.beginPath();
@@ -574,7 +576,7 @@ function drawUI(now) {
     c.stroke();
   }
   // flume walls
-  c.strokeStyle = 'rgba(200, 215, 230, 0.55)'; c.lineWidth = 1.5; c.strokeRect(X0, Y0, X1 - X0, Y1 - Y0);
+  c.strokeStyle = 'rgba(200, 215, 230, 0.16)'; c.lineWidth = 1; c.strokeRect(Math.round(X0) + 0.5, Math.round(Y0) + 0.5, Math.round(X1 - X0), Math.round(Y1 - Y0));
   // bed profile in bed mode
   if (tool === 'bed') {
     c.strokeStyle = '#f2c14e'; c.lineWidth = 1.5; c.beginPath();
@@ -1029,6 +1031,7 @@ function wire() {
   $('scale').addEventListener('change', (e) => setScale(e.target.value));
   $('len').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ L: v }); else syncDomainInputs(); });
   $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
+  $('grid').addEventListener('change', (e) => { showGrid = e.target.value === '1'; });
   $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
   $('run').addEventListener('click', () => setRunning(!running));
   $('restart').addEventListener('click', restart);

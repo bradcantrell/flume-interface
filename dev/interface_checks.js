@@ -202,7 +202,7 @@ const run = (code) => vm.runInContext(code, sandbox);
   T.fitView(); const v = T.view;
   const [Xp, Yp] = T.w2s(7.3, 0.42), [xb, zb] = T.s2w(Xp, Yp);
   check('screen and world coordinates round-trip', Math.abs(xb - 7.3) < 1e-9 && Math.abs(zb - 0.42) < 1e-9);
-  check('the fitted view shows the whole flume with vertical exaggeration', T.w2s(0, 0)[0] >= 0 && T.w2s(20, 0)[0] <= v.cw && v.ve > 1);
+  check('the fitted view shows the whole flume with gentle vertical exaggeration (1 to 3)', T.w2s(0, 0)[0] >= 0 && T.w2s(20, 0)[0] <= v.cw && v.ve > 1 && v.ve <= 3);
   const [wx, wz] = T.s2w(400, 300); T.zoomAt(400, 300, 3); const [wx2, wz2] = T.s2w(400, 300);
   check('wheel zoom keeps the point under the pointer in place', Math.abs(wx - wx2) < 1e-9 && Math.abs(wz - wz2) < 1e-9);
   const [, vz] = T.s2w(400, 300); T.setVE(400, 300, 2); const [, vz2] = T.s2w(400, 300);

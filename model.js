@@ -552,6 +552,79 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
       let d2 = (dx2*dx2 + dz2*dz2)/(r*r);
       if (d2 > 1.0 || solid[c] != 0u || f[c] < 0.5) { return; }
       dye[c] = max(dye[c], spv(3u)*(1.0 - d2*d2));`),
+    // particles, for the look (abstract, like the sediment interface's grains). Each: x, z, -, -, vx,
+    // vz, age, kind. Tracers (kind 0) ride the flow in the water and are reborn at random water cells.
+    // Foam (kind 1) is born where the water is torn up (strong shear, or water thrown upward at the
+    // surface); in the air it flies ballistically, in the water it rides the flow, rises, and fades.
+    // PU: 0 dt (s of model time this frame), 1 time, 2 frame, 3 tracers, 4 foam, 5 still depth, 6 -, 7 -
+    partStep: K([['u', 'f'], ['w', 'f'], ['f', 'f'], ['solid', 'u'], ['eta', 'f'], ['PT', 'f'], ['PU', 'U']], `let nT = u32(spv(3u)); let nF = u32(spv(4u)); if (c >= nT + nF) {return;}
+      let dt = spv(0u); let o = 8u*c; let kind = select(0u, 1u, c >= nT);
+      var x = PT[o]; var z = PT[o+1u]; var vx = PT[o+4u]; var vz = PT[o+5u]; var age = PT[o+6u];
+      var sd = c*747796405u + u32(spv(2u))*2891336453u + 12345u;
+      let life = select(2.5 + 3.5*rnd(&sd), 1.0 + 2.0*rnd(&sd), kind == 1u);
+      let L = f32(prm.nx)*prm.dx; let Hd = f32(prm.nz)*prm.dx; let h0 = max(spv(5u), prm.dx);
+      if (age >= 0.0) { age += dt; }
+      let inside = x > 0.0 && x < L && z > 0.0 && z < Hd;
+      let cl = cellOf(x, z); let wet = inside && solid[cl] == 0u && fAt2(x, z) >= 0.5; let dry = inside && solid[cl] == 0u && !wet;
+      if (kind == 0u) {
+        if (age < 0.0 || age > life || !wet) {
+          // reborn at a random water cell (a few tries)
+          age = -1.0;
+          for (var t = 0u; t < 4u; t++) {
+            let xi = rnd(&sd)*L; let zi = rnd(&sd)*Hd; let ci = cellOf(xi, zi);
+            if (solid[ci] == 0u && fAt2(xi, zi) >= 0.5) { x = xi; z = zi; age = 0.0; break; }
+          }
+          let v = vel(x, z); vx = v.x; vz = v.y;
+        } else if (dt > 0.0) {
+          let v1 = vel(x, z); let v2 = vel(x + 0.5*dt*v1.x, z + 0.5*dt*v1.y);
+          x += dt*v2.x; z += dt*v2.y; vx = v2.x; vz = v2.y;
+        }
+      } else {
+        if (age < 0.0 || age > life || !inside || (inside && solid[cl] != 0u)) {
+          age = -1.0;
+          // try to be born: a random column, at its surface or somewhere in the water below it
+          let i = min(u32(rnd(&sd)*f32(prm.nx)), prm.nx - 1u); let e = eta[i];
+          if (e > 0.0 && dt > 0.0) {
+            let atSurf = rnd(&sd) < 0.6;
+            let zb = select(rnd(&sd)*e, e - rnd(&sd)*2.0*prm.dx, atSurf);
+            let xb = (f32(i) + rnd(&sd))*prm.dx;
+            let cb = cellOf(xb, zb);
+            if (solid[cb] == 0u && fAt2(xb, zb) >= 0.5) {
+              let v = vel(xb, zb); let sh = shearAt(xb, zb);
+              // the local depth (surface down to the first solid) sets the shear and speed scales
+              var kd = u32(clamp(e/prm.dx, 0.0, f32(prm.nz) - 1.0)); while (kd > 0u && solid[i + prm.nx*kd] == 0u) { kd--; }
+              let hl = max(e - f32(kd + 1u)*prm.dx, 2.0*prm.dx);
+              let tsc = sqrt(prm.g/hl);
+              // torn-up water: shear well above what the mean flow alone gives (|u|/h), so a smooth fast
+              // jet makes none but the eddies of a jump roller or a breaking crest do; only in the upper
+              // part of the water, where air gets in
+              let near = smoothstep(0.55, 0.8, (zb - f32(kd + 1u)*prm.dx)/hl);
+              var m = near*smoothstep(2.5, 5.0, sh/(length(v)/hl + 0.3*tsc));
+              let up = smoothstep(0.08, 0.25, v.y/sqrt(prm.g*hl));
+              let im = max(i, 1u) - 1u; let ip = min(i + 1u, prm.nx - 1u);
+              let slope = select(0.0, abs(eta[ip] - eta[im])/(f32(ip - im)*prm.dx), eta[im] > 0.0 && eta[ip] > 0.0);
+              if (atSurf) { m = max(m, max(up, smoothstep(0.25, 0.7, slope))); }
+              if (rnd(&sd) < m) {
+                x = xb; z = zb; age = 0.0; vx = v.x; vz = v.y;
+                if (atSurf && up > 0.0) { vx = v.x*(1.0 + 0.3*rnd(&sd)); vz = v.y*(1.1 + 0.6*rnd(&sd)) + 0.1*sqrt(prm.g*h0)*rnd(&sd); }
+              }
+            }
+          }
+        } else if (dt > 0.0) {
+          if (dry) { vz -= prm.g*dt; vx *= (1.0 - 0.5*dt); x += vx*dt; z += vz*dt; }
+          else if (wet) { let v = vel(x, z); let rise = 0.04*sqrt(prm.g*h0);
+            // bubbles dragged deep dissolve quickly, so foam stays near the surface instead of hanging in curtains
+            let sub = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - z; age += dt*4.0*smoothstep(0.15, 0.5, sub/h0);
+            vx = v.x; vz = v.y + rise; x += vx*dt; z += vz*dt; if (z > eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)]) { z = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - 0.2*prm.dx; } }
+        }
+      }
+      PT[o] = x; PT[o+1u] = z; PT[o+4u] = vx; PT[o+5u] = vz; PT[o+6u] = age; PT[o+7u] = f32(kind);`,
+      SAMPLE + `fn rnd(s: ptr<function, u32>) -> f32 { *s = *s*747796405u + 2891336453u; var r = ((*s >> ((*s >> 28u) + 4u)) ^ *s)*277803737u; r = (r >> 22u) ^ r; return f32(r)/4294967295.0; }
+fn cellOf(x:f32, z:f32) -> u32 { let i = u32(clamp(x/prm.dx, 0.0, f32(prm.nx) - 1.0)); let k = u32(clamp(z/prm.dx, 0.0, f32(prm.nz) - 1.0)); return i + prm.nx*k; }
+fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
+fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
+fn shearAt(x:f32, z:f32) -> f32 { let d = prm.dx; return abs(sU(x, z + d) - sU(x, z - d))/(2.0*d) + abs(sW(x + d, z) - sW(x - d, z))/(2.0*d); }
+`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -759,6 +832,16 @@ struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32,
   let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
   return vec4f(p[i], 0.0, 1.0);
 }
+// local surface above row k in column i: (height, found) from the first non-solid air cell upward
+fn surfAt(i:i32, k:i32) -> vec2f {
+  let nx = i32(V0.nx); let nz = i32(V0.nz); var kk = k;
+  for (var q = 0; q < 16; q++) {
+    if (kk >= nz) { return vec2f(f32(nz)*V0.dx, 1.0); }
+    let c = u32(i + nx*kk); if (solid[c] == 0u && f[c] < 0.5) { return vec2f((f32(kk) + clamp(f[c], 0.0, 0.5))*V0.dx, 1.0); }
+    kk += 1;
+  }
+  return vec2f(0.0, 0.0);
+}
 fn smp(i:i32, k:i32) -> f32 {
   let nx = i32(V0.nx); let nz = i32(V0.nz);
   let ii = clamp(i, 0, nx - 1); let kk = clamp(k, 0, nz - 1); let c = u32(ii + nx*kk);
@@ -783,11 +866,21 @@ fn smp(i:i32, k:i32) -> f32 {
   let cc = u32(ci + nx*ck);
   let inside = x >= 0.0 && x <= V0.L && z >= 0.0 && z <= V0.H && solid[cc] == 0u;
   let alpha = clamp((fv - 0.5) / dfv + 0.5, 0.0, 1.0);
-  // colour by depth under the local surface
-  let e = eta[u32(ci)];
-  let d = max(e - z, 0.0);
+  // colour by depth under the local surface (blended between columns, so no stripes)
+  let gxe = clamp(x / V0.dx - 0.5, 0.0, V0.nx - 1.0); let ie0 = u32(floor(gxe)); let ie1 = min(ie0 + 1u, u32(nx - 1));
+  let e0 = eta[ie0]; let e1 = eta[ie1]; let ae = gxe - f32(ie0);
+  let e = select(select(mix(e0, e1, ae), e0, e1 < 0.0), e1, e0 < 0.0);
+  // depth under the surface measured locally: up from this row to the first air cell (at most 16
+  // cells) in the two nearest columns, with that cell's fill as the fraction, blended across, so spray
+  // or a broken surface above does not make the colour jump and there are no column stripes
+  let gxs = clamp(x / V0.dx - 0.5, 0.0, V0.nx - 1.0); let cs0 = i32(floor(gxs)); let cs1 = min(cs0 + 1, nx - 1);
+  let sf0 = surfAt(cs0, ck); let sf1 = surfAt(cs1, ck); let as_ = gxs - f32(cs0);
+  var zs = max(e, z + 16.0*V0.dx);
+  if (sf0.y > 0.5 && sf1.y > 0.5) { zs = mix(sf0.x, sf1.x, as_); } else if (sf0.y > 0.5) { zs = sf0.x; } else if (sf1.y > 0.5) { zs = sf1.x; }
+  let d = max(zs - z, 0.0);
   let t = clamp(d / V0.depthRef, 0.0, 1.0);
-  var col = mix(vec3f(0.40, 0.76, 0.84), vec3f(0.03, 0.17, 0.34), sqrt(t));
+  // deep water dark navy, glowing brighter toward the surface (the cut face of a flume, lit from above)
+  var col = mix(vec3f(0.08, 0.40, 0.66), vec3f(0.01, 0.05, 0.14), pow(t, 0.6));
   if (V0.mode > 0.5) {
     let W = u32(nx + 1);
     let uc = 0.5*(u[u32(ci) + W*u32(ck)] + u[u32(ci) + 1u + W*u32(ck)]);
@@ -812,10 +905,47 @@ fn smp(i:i32, k:i32) -> f32 {
   col = mix(col, vec3f(0.93, 0.97, 1.0), foam*0.75);
   // bright line along the free surface
   let hl = 1.0 - clamp(abs(fv - 0.5) / (dfv*1.6), 0.0, 1.0);
-  col = mix(col, vec3f(0.88, 0.97, 1.0), hl*0.85);
-  let a1 = select(0.0, alpha*0.93, inside);
+  col = mix(col, vec3f(0.80, 0.95, 1.0), hl*0.7);
+  let a1 = select(0.0, alpha*0.90, inside);
   return vec4f(col*a1, a1);
 }
+`;
+
+  // Particles: instanced streaks from each particle back along its velocity, drawn additively.
+  const RENDER_P = `
+struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32, nz:f32, mode:f32, H:f32, time:f32, umax:f32, depthRef:f32, dpr:f32 };
+@group(0) @binding(0) var<uniform> V0: V;
+@group(0) @binding(1) var<storage, read> P: array<f32>;
+struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1) t: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  let o = 8u*ii; let x = P[o]; let z = P[o+1u]; let vx = P[o+4u]; let vz = P[o+5u]; let age = P[o+6u]; let kind = P[o+7u];
+  var out: VO;
+  if (age < 0.0) { out.pos = vec4f(2.0, 2.0, 0.0, 1.0); out.col = vec4f(0.0); out.t = 0.0; return out; }
+  let hx = (x - V0.x0)*V0.s; let hy = V0.ch - (z - V0.z0)*V0.s*V0.ve;
+  let foam = kind > 0.5;
+  let trail = select(0.10, 0.05, foam);                       // seconds of path behind the head
+  var tx = hx - vx*trail*V0.s; var ty = hy + vz*trail*V0.s*V0.ve;
+  var d = vec2f(hx - tx, hy - ty); var len = length(d);
+  let maxLen = select(10.0, 6.0, foam)*V0.dpr;
+  if (len > maxLen) { d = d*(maxLen/len); tx = hx - d.x; ty = hy - d.y; len = maxLen; }
+  let minLen = 1.5*V0.dpr;
+  if (len < minLen) { d = vec2f(minLen, 0.0); tx = hx - minLen; ty = hy; len = minLen; }
+  let dir = d/len; let nrm = vec2f(-dir.y, dir.x);
+  let hw = select(0.6, 0.9, foam)*V0.dpr;
+  let corners = array<vec2f, 6>(vec2f(0.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+  let cc = corners[vi];
+  let p = mix(vec2f(tx, ty), vec2f(hx, hy), cc.x) + nrm*hw*cc.y;
+  out.pos = vec4f(p.x/V0.cw*2.0 - 1.0, 1.0 - p.y/V0.ch*2.0, 0.0, 1.0);
+  out.t = cc.x;
+  if (!foam) {
+    let sp = clamp(length(vec2f(vx, vz))/max(V0.umax, 0.05), 0.0, 1.0);
+    out.col = vec4f(mix(vec3f(0.20, 0.45, 0.80), vec3f(0.70, 0.90, 1.0), sp), 0.05 + 0.30*sp);
+  } else {
+    out.col = vec4f(1.0, 1.0, 1.0, 0.9*clamp(1.0 - age/3.0, 0.0, 1.0));
+  }
+  return out;
+}
+@fragment fn fs(in: VO) -> @location(0) vec4f { let a = in.col.a*in.t; return vec4f(in.col.rgb*a, a); }
 `;
 
   // ───────────────────────── wave theory ─────────────────────────
@@ -866,6 +996,7 @@ fn smp(i:i32, k:i32) -> f32 {
       <div class="row"><label for="m-sed">moving bed</label><select id="m-sed"><option value="1">on</option><option value="0">off</option></select></div>
       <div class="row m-river"><label for="m-feed">sediment supply</label><select id="m-feed"><option value="1">equilibrium</option><option value="0">none (clear water)</option></select></div>
       <div class="row"><label for="m-mf">bed speed-up</label><input id="m-mf" type="number" min="1" max="200" step="1" title="the bed changes this many times faster than the water (morphological factor)"></div>
+      <div class="row"><label for="m-part">particles</label><select id="m-part"><option value="both">tracers and foam</option><option value="foam">foam only</option><option value="tracers">tracers only</option><option value="off">off</option></select></div>
       <div class="row"><label for="m-color">water colour</label>
         <select id="m-color"><option value="0">depth</option><option value="1">speed</option></select></div>`,
     wire() {
@@ -877,6 +1008,7 @@ fn smp(i:i32, k:i32) -> f32 {
       });
       $('m-type').addEventListener('change', (e) => { M.p.type = e.target.value; M.syncControls(); M.applyParams(); M.reset(); M.api && M.api.changed(); });
       $('m-color').addEventListener('change', (e) => { M.colorMode = +e.target.value; });
+      $('m-part').addEventListener('change', (e) => { M.particles = e.target.value !== 'off'; M.drawKinds = e.target.value; });
       $('m-sed').addEventListener('change', (e) => { M.p.sediment = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
       $('m-feed').addEventListener('change', (e) => { M.p.feed = e.target.value === '1'; M.applyParams(); M.api && M.api.changed(); });
       $('m-mf').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v >= 1) M.p.morfac = Math.min(v, 200); M.syncControls(); M.applyParams(); M.api && M.api.changed(); });
@@ -984,12 +1116,14 @@ fn smp(i:i32, k:i32) -> f32 {
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
     };
     const P0 = ubuf();
     const SPU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const DIU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const PU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const nT = Math.max(3000, Math.min(20000, Math.round(N / 10))), nF = 16000;
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
     while (L[L.length - 1].nx > 8 && L[L.length - 1].nz > 4) {
       const f = L[L.length - 1], cnx = Math.ceil(f.nx / 2), cnz = Math.ceil(f.nz / 2), n = cnx * cnz;
@@ -1029,6 +1163,7 @@ fn smp(i:i32, k:i32) -> f32 {
       sedAvalB: D('sedAval', P0, [B.bed, SPU], Math.ceil(nx / 2), { PAR: 1 }),
       dyeAdv: D('dyeAdv', P0, [B.u, B.w, B.typ, B.dye, B.dye2], N),
       dyeInject: D('dyeInject', P0, [B.f, B.solid, B.dye, DIU], N),
+      partStep: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.P, PU], nT + nF),
       plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
@@ -1054,7 +1189,7 @@ fn smp(i:i32, k:i32) -> f32 {
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, SPU, DIU, N, NU, NW, all: all.concat([P0, SPU, DIU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, DIU, PU, nT, nF, N, NU, NW, all: all.concat([P0, SPU, DIU, PU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -1163,6 +1298,7 @@ fn smp(i:i32, k:i32) -> f32 {
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
   M.reset = function () {
     M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false;
+    if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz); }
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
@@ -1264,11 +1400,14 @@ fn smp(i:i32, k:i32) -> f32 {
       for (let j = 0; j < n; j++) encodeStep(enc, M.stepCount = (M.stepCount || 0) + 1);
       encodeDiag(enc);
       M.device.queue.submit([enc.finish()]);
-      M.t += n * M.dt; M.stepsFrame = n;
+      M.t += n * M.dt; M.stepsFrame = n; M.lastAdvance = n * M.dt;
       M.busy = true; const t0 = performance.now();
       M.device.queue.onSubmittedWorkDone().then(() => { M.msStep = (performance.now() - t0) / n; M.busy = false; }, () => { M.busy = false; });
     }
     if (M.frameNo % 6 === 0 && !M.readBusy) readScalars();
+    // particles once a frame, by the model time this frame advanced (0 when paused)
+    M.stepParticles(running && M.lastAdvance ? M.lastAdvance : 0);
+    M.lastAdvance = 0;
     if (M.watching && M.frameNo % 2 === 0 && !M.etaBusy) readSurface();
     if (M.p.sediment && running && M.frameNo % 30 === 0 && !M.bedBusy) readBed();
     if (M.hasPlants && running && M.frameNo % 3 === 0 && !M.plantBusy) readPlants();
@@ -1295,6 +1434,12 @@ fn smp(i:i32, k:i32) -> f32 {
       M.bedBusy = false;
     }, () => { M.bedBusy = false; });
   }
+  M.stepParticles = function (dtp) {
+    if (!M.ok || !M.S || M.particles === false) return;
+    M.pFrame = (M.pFrame || 0) + 1;
+    M.device.queue.writeBuffer(M.S.PU, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nT, M.S.nF, Math.max(M.p.h0 - (M.P ? M.P.zin : 0), M.grid.dx), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.partStep); ps.end(); M.device.queue.submit([e.finish()]);
+  };
   // dye tool: release dye in a disc at (x, z) of radius r (m)
   M.injectDye = function (x, z, r) {
     if (!M.ok || !M.S) return;
@@ -1353,15 +1498,22 @@ fn smp(i:i32, k:i32) -> f32 {
       const U = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const B = M.S.B;
       const bg = M.device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [U, B.f, B.solid, B.u, B.w, B.eta, B.dye, B.cs].map((b, j) => ({ binding: j, resource: { buffer: b } })) });
-      M.render_ = { p, U, bg };
+      const mp = M.device.createShaderModule({ code: RENDER_P });
+      const pp = M.device.createRenderPipeline({ layout: 'auto', vertex: { module: mp, entryPoint: 'vs' },
+        fragment: { module: mp, entryPoint: 'fs', targets: [{ format: M.format, blend: { color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' } } }] },
+        primitive: { topology: 'triangle-list' } });
+      const pbg = M.device.createBindGroup({ layout: pp.getBindGroupLayout(0), entries: [U, B.P].map((b, j) => ({ binding: j, resource: { buffer: b } })) });
+      M.render_ = { p, U, bg, pp, pbg };
     }
     const g = M.grid, r = view.dpr || 1;
     const v = new Float32Array([view.x0, view.z0, view.s * r, view.ve, view.cw * r, view.ch * r, g.dx, g.nx * g.dx, g.nx, g.nz, M.colorMode,
-      g.nz * g.dx, M.t, Math.max(M.vmax, 0.05), Math.max(M.p.h0, g.dx), 0]);
+      g.nz * g.dx, M.t, Math.max(M.vmax, 0.05), Math.max(M.p.h0, g.dx), r]);
     M.device.queue.writeBuffer(M.render_.U, 0, v);
     const enc = M.device.createCommandEncoder();
     const pass = enc.beginRenderPass({ colorAttachments: [{ view: (view.target || M.ctx.getCurrentTexture()).createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
-    pass.setPipeline(M.render_.p); pass.setBindGroup(0, M.render_.bg); pass.draw(3); pass.end();
+    pass.setPipeline(M.render_.p); pass.setBindGroup(0, M.render_.bg); pass.draw(3);
+    if (M.particles !== false) { pass.setPipeline(M.render_.pp); pass.setBindGroup(0, M.render_.pbg); const k = M.drawKinds; pass.draw(6, k === 'tracers' ? M.S.nT : k === 'foam' ? M.S.nF : M.S.nT + M.S.nF, 0, k === 'foam' ? M.S.nT : 0); }
+    pass.end();
     M.device.queue.submit([enc.finish()]);
   };
   let rb = null;
