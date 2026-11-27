@@ -81,7 +81,8 @@
     <h1>Flume Interface</h1>
     <div class="btns">
       <button id="run" class="primary">run</button>
-      <button id="restart">restart</button>
+      <button id="restart" title="Start the water again from still, keeping the drawing">restart</button>
+      <button id="clear" title="Remove the drawing, bed edits and gauges, and start with still water (undo brings the drawing back)">clear</button>
       <button id="clear-dye" title="Clear the dye">clear dye</button>
       <select id="speed" title="model seconds per real second"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>real time</option><option value="2">2× speed</option><option value="4">4× speed</option></select>
     </div>
@@ -110,7 +111,7 @@
 
     <h2>Scene</h2>
     <div class="btns">
-      <button id="undo">undo</button><button id="save">save</button><button id="open">open</button><button id="clear">clear</button>
+      <button id="undo">undo</button><button id="save">save</button><button id="open">open</button>
       <button id="still" title="Save the view as a PNG">save image</button><button id="record" title="Record the view as a WebM video">record video</button>
       <input id="open-file" type="file" accept=".json,application/json" hidden>
     </div>
@@ -1183,7 +1184,8 @@ function wire() {
     const f = e.target.files && e.target.files[0]; if (!f) return;
     f.text().then((t) => { if (!openSceneText(t)) alert('That file is not a flume scene.'); e.target.value = ''; });
   });
-  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.gauges = []; clearGaugeData(); scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); });
+  // clear: an empty flume with still water (the drawing goes on the undo stack)
+  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.gauges = []; clearGaugeData(); scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); restart(); });
   const gc = $('gauge-cv');
   gc.addEventListener('pointermove', gaugeTip);
   gc.addEventListener('pointerleave', () => { gaugeHover = null; $('gauge-tip').hidden = true; });

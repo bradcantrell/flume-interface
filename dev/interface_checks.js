@@ -244,6 +244,10 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const n = T.scene.shapes.length, r0 = C.reset;
+    if (!n) T.scene.shapes.push({ id: 999, kind: 'rect', pts: [[1, 0.2], [2, 0.4]], mat: 1, props: {} });
+    getEl('clear').click();
+    check('clear empties the flume and starts the water again (and undo brings the drawing back)', T.scene.shapes.length === 0 && C.reset === r0 + 1 && (getEl('undo').click(), T.scene.shapes.length > 0)); }
   check('keys typed into a number box are not taken as shortcuts', (T.onKey({ key: ' ', target: { tagName: 'INPUT' }, preventDefault() {} }), T.running === false));
   check('the render view carries the device pixel ratio', C.view && C.view.dpr === 1 && C.view.cw === W);
 
