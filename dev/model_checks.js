@@ -387,6 +387,28 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('the water renderer (with dye, plumes and foam) builds and draws', !rerr2, rerr2);
   }
 
+  // 23. restart: a river with a moving bed, dye and suspended sand, then reset with a bed readback in
+  // flight; everything goes back to the design and the stale readback is not applied
+  if (want('restart')) {
+    const zb = 0.10, rr = flume(6, 0.5, dx, (x, z) => (z < zb ? 4 : (x > 2.5 && x < 2.8 && z < 0.2) ? 1 : 0));
+    await setup(rr, { type: 'river', h0: 0.30, q: 0.10, hout: 0.22, sediment: true, morfac: 30 });
+    const dtp = stepFor(dx, 1.0); M.injectDye(1.5, 0.2, 0.06); await M.debug.steps(Math.round(20 / dtp), dtp);
+    const N = rr.nx * rr.nz, sum = (a) => { let m = 0; for (const v of a) m += Math.abs(v); return m; };
+    const csBefore = sum(await M.debug.read('cs')), bedA = await M.debug.read('bed');
+    let moved = 0; for (let i = 0; i < rr.nx; i++) moved = Math.max(moved, Math.abs(bedA[3 * i] - M.bed0.zs[i]));
+    let applied = 0; const api0 = M.api; M.api = Object.assign({}, api0, { bedChanged: () => { applied++; } });
+    M.debug.readBed(); M.reset();
+    await M.device.queue.onSubmittedWorkDone(); await new Promise(r => setTimeout(r, 200));
+    const staleApplied = applied;
+    M.debug.readBed(); await M.device.queue.onSubmittedWorkDone(); await new Promise(r => setTimeout(r, 200));
+    M.api = api0;
+    const bedB = await M.debug.read('bed'); let back = 0; for (let i = 0; i < rr.nx; i++) back = Math.max(back, Math.abs(bedB[3 * i] - M.bed0.zs[i]));
+    const left = { cs: sum(await M.debug.read('cs')), dye: sum(await M.debug.read('dye')), u: sum(await M.debug.read('u')), w: sum(await M.debug.read('w')), nt: sum(await M.debug.read('nt')) };
+    check('restart clears the run: bed back to the design, no sand, dye or motion left in the water', moved > 0.002 && csBefore > 0 && back < 1e-6 && left.cs === 0 && left.dye === 0 && left.u === 0 && left.w === 0 && left.nt === 0 && M.t === 0,
+      'bed had moved ' + (moved * 100).toFixed(1) + ' cm, back within ' + back.toExponential(1) + ' m; left: ' + JSON.stringify(left));
+    check('a bed readback started before the restart is dropped (a new one is applied)', staleApplied === 0 && applied === 1, 'stale applied ' + staleApplied + ', new applied ' + (applied - staleApplied));
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

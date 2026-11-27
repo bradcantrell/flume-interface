@@ -1195,6 +1195,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   };
 
   M.setRaster = function (raster) {
+    M.gen = (M.gen || 0) + 1;     // a design edit also outdates readbacks in flight
     M.raster = raster;
     if (!M.ok || !M.S) return;
     const N = M.S.N, solid = new Uint32Array(N), m = raster.mat;
@@ -1294,8 +1295,12 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   };
 
   // Fill still water to h0 (fractional top cell), zero velocity, time 0.
+  M.gen = 0;
   M.reset = function () {
-    M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false;
+    // readbacks already in flight carry the old run: bumping the generation makes them drop their
+    // result when they land, so a restart is not painted over by the bed or surface it replaced
+    M.gen++;
+    M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0];
     if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz); }
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
@@ -1305,6 +1310,11 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
     writeBed();
     const B = M.S.B, q = M.device.queue;
     q.writeBuffer(B.f, 0, f); q.writeBuffer(B.u, 0, new Float32Array(M.S.NU)); q.writeBuffer(B.w, 0, new Float32Array(M.S.NW)); q.writeBuffer(B.tb, 0, new Float32Array(4));
+    // everything else the last run left in the water: suspended sand, dye in transit, turbulence,
+    // the solver's working fields
+    { const ce = M.device.createCommandEncoder();
+      for (const n of ['cs', 'cs2', 'dye2', 'nt', 'u2', 'w2', 'uvA', 'uvB', 'wvA', 'wvB', 'uM', 'wM', 'flx', 'p', 'ust', 'ustK', 'qc', 'qb']) if (B[n]) ce.clearBuffer(B[n]);
+      q.submit([ce.finish()]); }
     let v = 0; for (let c = 0; c < N; c++) v += f[c]; M.vol0 = v * dx * dx; M.vol = M.vol0; M.vmax = 0;
     M.applyParams();
     const e = M.device.createCommandEncoder(), pass = e.beginComputePass(); run(pass, M.S.d.surface); pass.end(); q.submit([e.finish()]);
@@ -1413,11 +1423,12 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   // the moving bed, for drawing: which cells are sediment, their mix and deposit time
   function readBed() {
     if (!M.S || !M.bed0) return;
-    M.bedBusy = true;
+    M.bedBusy = true; const gen = M.gen;
     const B = M.S.B, names = ['solid', 'cell', 'bed'], st = {}, e = M.device.createCommandEncoder();
     for (const n of names) { st[n] = M.device.createBuffer({ size: B[n].size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }); e.copyBufferToBuffer(B[n], 0, st[n], 0, B[n].size); }
     M.device.queue.submit([e.finish()]);
     Promise.all(names.map(n => st[n].mapAsync(GPUMapMode.READ))).then(() => {
+      if (gen !== M.gen) { for (const n of names) { st[n].unmap(); st[n].destroy(); } M.bedBusy = false; return; }
       const N = M.grid.nx * M.grid.nz, solid = new Uint32Array(st.solid.getMappedRange().slice(0, N * 4));
       const cell = new Float32Array(st.cell.getMappedRange().slice(0, 4 * N * 4)), bed = new Float32Array(st.bed.getMappedRange().slice(0, 3 * M.grid.nx * 4));
       const comp = new Float32Array(3 * N), tdep = new Float32Array(N), zs = new Float32Array(M.grid.nx);
@@ -1450,11 +1461,12 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   M.plantSample = function () { return M.hasPlants ? M.plantHost : null; };
   function readPlants() {
     if (!M.S) return;
-    M.plantBusy = true; const B = M.S.B.po, n = M.grid.nx;
+    M.plantBusy = true; const B = M.S.B.po, n = M.grid.nx, gen = M.gen;
     const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const e = M.device.createCommandEncoder(); e.copyBufferToBuffer(B, 0, st, 0, B.size); M.device.queue.submit([e.finish()]);
     st.mapAsync(GPUMapMode.READ).then(() => {
       const a = new Float32Array(st.getMappedRange().slice(0, 2 * n * 4)); st.unmap(); st.destroy();
+      if (gen !== M.gen) { M.plantBusy = false; return; }
       const le = new Float32Array(n), dir = new Float32Array(n); for (let i = 0; i < n; i++) { le[i] = a[2 * i]; dir[i] = a[2 * i + 1]; }
       M.plantHost = { le, dir }; M.plantBusy = false;
     }, () => { M.plantBusy = false; });
@@ -1465,20 +1477,21 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   M.gaugeWindow = function () { return M.p.type === 'wave' ? Math.max(3 * (M.p.T || 2), 6) : 10; };
   function readSurface() {
     if (!M.S) return;
-    M.etaBusy = true; const t = M.t, n = M.grid.nx, B = M.S.B.eta;
+    M.etaBusy = true; const t = M.t, n = M.grid.nx, B = M.S.B.eta, gen = M.gen;
     const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const e = M.device.createCommandEncoder(); e.copyBufferToBuffer(B, 0, st, 0, B.size); M.device.queue.submit([e.finish()]);
     st.mapAsync(GPUMapMode.READ).then(() => {
-      M.etaHost = { t, eta: new Float32Array(st.getMappedRange().slice(0, n * 4)), dx: M.grid.dx };
+      if (gen === M.gen) M.etaHost = { t, eta: new Float32Array(st.getMappedRange().slice(0, n * 4)), dx: M.grid.dx };
       st.unmap(); st.destroy(); M.etaBusy = false;
     }, () => { M.etaBusy = false; });
   }
   function readScalars() {
-    M.readBusy = true;
+    M.readBusy = true; const gen = M.gen;
     const st = M.device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const e = M.device.createCommandEncoder(); e.copyBufferToBuffer(M.S.B.scal, 0, st, 0, 32); M.device.queue.submit([e.finish()]);
     st.mapAsync(GPUMapMode.READ).then(() => {
       const a = new Float32Array(st.getMappedRange().slice(0)); st.unmap(); st.destroy();
+      if (gen !== M.gen) { M.readBusy = false; return; }
       if (isFinite(a[7])) M.vmax = a[7];
       if (isFinite(a[6]) && a[6] > 0) M.vol = a[6] * M.grid.dx * M.grid.dx;
       M.readBusy = false;
@@ -1569,6 +1582,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       await M.device.queue.onSubmittedWorkDone();
     },
     write(name, data) { M.device.queue.writeBuffer(M.S.B[name], 0, data); },
+    readBed() { readBed(); },                // start the page's bed readback (for the restart check)
     async read(name) {
       const B = M.S.B[name], n = B.size / 4;
       const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
