@@ -93,6 +93,7 @@
     <div class="row"><label for="scale">scale</label><select id="scale"><option value="lab">lab</option><option value="field">field</option></select></div>
     <div class="row"><label for="len">length (m)</label><input id="len" type="number" step="any" min="0.5"></div>
     <div class="row"><label for="hgt">height (m)</label><input id="hgt" type="number" step="any" min="0.05"></div>
+    <div class="row"><label for="bedstyle">bed drawing</label><select id="bedstyle"><option value="both">patterns and lines</option><option value="patterns">patterns</option><option value="lines">lines</option></select></div>
     <div class="row"><label for="grid">lab grid</label><select id="grid"><option value="0">off</option><option value="1">on</option></select></div>
     <div class="row"><label for="res">resolution</label><select id="res"><option value="draft">draft</option><option value="normal">normal</option><option value="fine">fine</option></select></div>
 
@@ -460,6 +461,54 @@ function buildCutLines(opq, isSolid) {
   const inSed = (i, k) => { if (i < 0 || k < 0 || i + 1 >= nx || k + 1 >= nz) return false; const c = i + nx * k; return sed[c] && sed[c + 1] && sed[c + nx] && sed[c + nx + 1]; };
   const a = contour(nx, nz, (i, k) => sF[i + nx * k], 0.5, inSed), b = contour(nx, nz, (i, k) => sG[i + nx * k], 0.5, inSed);
   layerSegs = new Float32Array(a.length + b.length); layerSegs.set(a); layerSegs.set(b, a.length);
+  // one mask per grain class (alpha = that class's share times the cell's coverage), for the
+  // lithologic patterns; row 0 of the canvas is the top of the flume
+  for (let j = 0; j < 3; j++) {
+    if (!grainMask[j]) grainMask[j] = document.createElement('canvas');
+    const cv = grainMask[j]; if (cv.width !== nx || cv.height !== nz) { cv.width = nx; cv.height = nz; }
+    const cx = cv.getContext('2d'), im = cx.createImageData(nx, nz), d = im.data;
+    for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) {
+      const c = i + nx * k; if (!sed[c]) continue;
+      const w = j === 0 ? sF[c] : j === 2 ? sG[c] : Math.max(0, 1 - sF[c] - sG[c]);
+      const o = 4 * (i + nx * (nz - 1 - k)); d[o] = d[o + 1] = d[o + 2] = 255; d[o + 3] = Math.round(255 * Math.min(1, w) * Math.min(1, opq[c] * 1.0));
+    }
+    cx.putImageData(im, 0, 0);
+  }
+}
+// Lithologic patterns after the FGDC sedimentary series (as on Fisk's sections): fine sand a fine
+// stipple, coarse sand a coarser stipple, gravel small open circles. Drawn in screen space at a fixed
+// size, anchored to the flume so they move with it, dim white inside the black ground.
+const grainMask = [null, null, null];
+let grainTiles = null, patCanvas = null;
+function makeGrainTiles(r) {
+  const tile = (n, draw) => { const cv = document.createElement('canvas'); cv.width = cv.height = Math.round(n * r); const c = cv.getContext('2d'); c.scale(r, r); let sd = 7 + n; const rnd = () => (sd = (sd * 16807) % 2147483647) / 2147483647; draw(c, rnd, n); return cv; };
+  // dots and circles on a jittered grid, so the tile does not show as clumps
+  const jit = (c, rnd, n, m, f) => { const g = n / m; for (let a = 0; a < m; a++) for (let b = 0; b < m; b++) f(c, (a + 0.1 + 0.8 * rnd()) * g, (b + 0.1 + 0.8 * rnd()) * g, rnd); };
+  const dot = (rad) => (c, x, y) => { c.beginPath(); c.arc(x, y, rad, 0, 6.2832); c.fill(); };
+  return [
+    tile(30, (c, rnd, n) => { c.fillStyle = '#fff'; jit(c, rnd, n, 6, dot(0.55)); }),
+    tile(30, (c, rnd, n) => { c.fillStyle = '#fff'; jit(c, rnd, n, 4, dot(1.05)); }),
+    tile(46, (c, rnd, n) => { c.strokeStyle = '#fff'; c.lineWidth = 0.9; jit(c, rnd, n, 4, (c, x, y, rnd) => { const rr = 1.8 + rnd() * 1.5; c.beginPath(); c.ellipse(x, y, rr, rr * (0.75 + 0.25 * rnd()), rnd() * 3, 0, 6.2832); c.stroke(); }); }),
+  ];
+}
+let bedStyle = 'both';      // 'lines' (class boundaries only), 'patterns', 'both'
+function drawGrainPatterns(c) {
+  if (!grainMask[0] || bedStyle === 'lines') return;
+  const r = view.dpr, W = Math.round(view.cw * r), H = Math.round(view.ch * r);
+  if (!grainTiles || grainTiles.r !== r) { grainTiles = makeGrainTiles(r); grainTiles.r = r; }
+  if (!patCanvas) patCanvas = document.createElement('canvas');
+  if (patCanvas.width !== W || patCanvas.height !== H) { patCanvas.width = W; patCanvas.height = H; }
+  const p = patCanvas.getContext('2d'), [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
+  const [ax, ay] = w2s(0, 0);
+  for (let j = 0; j < 3; j++) {
+    p.setTransform(1, 0, 0, 1, 0, 0); p.globalCompositeOperation = 'source-over'; p.clearRect(0, 0, W, H);
+    p.imageSmoothingEnabled = true; p.drawImage(grainMask[j], X0 * r, Y0 * r, (X1 - X0) * r, (Y1 - Y0) * r);
+    p.globalCompositeOperation = 'source-in';
+    const pat = p.createPattern(grainTiles[j], 'repeat'); if (!pat) continue;
+    if (pat.setTransform && typeof DOMMatrix !== 'undefined') pat.setTransform(new DOMMatrix([1, 0, 0, 1, ax * r, ay * r]));
+    p.fillStyle = pat; p.fillRect(0, 0, W, H);
+    c.save(); c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 0.42; c.drawImage(patCanvas, 0, 0); c.restore();
+  }
 }
 const CUT_COLOR = '#ff2e93';
 function strokeSegs(c, segs) {
@@ -643,7 +692,8 @@ function drawUI(now) {
   if (matCanvas) c.drawImage(matCanvas, X0, Y0, X1 - X0, Y1 - Y0);
   // the section cut: dim white lines between grain classes, then the pink cut line on top
   c.lineJoin = 'round'; c.lineCap = 'round';
-  if (layerSegs.length) { c.strokeStyle = 'rgba(255,255,255,0.32)'; c.lineWidth = 1; strokeSegs(c, layerSegs); }
+  drawGrainPatterns(c);
+  if (layerSegs.length && bedStyle !== 'patterns') { c.strokeStyle = 'rgba(255,255,255,0.32)'; c.lineWidth = 1; strokeSegs(c, layerSegs); }
   if (cutSegs.length) { c.strokeStyle = CUT_COLOR; c.lineWidth = 1.75; strokeSegs(c, cutSegs); }
   drawDims(c);
   // plant stems
@@ -1118,6 +1168,7 @@ function wire() {
   $('len').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ L: v }); else syncDomainInputs(); });
   $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
   $('grid').addEventListener('change', (e) => { showGrid = e.target.value === '1'; });
+  $('bedstyle').addEventListener('change', (e) => { bedStyle = e.target.value; });
   $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
   $('run').addEventListener('click', () => setRunning(!running));
   $('restart').addEventListener('click', restart);
