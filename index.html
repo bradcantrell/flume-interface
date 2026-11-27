@@ -145,9 +145,11 @@
 // ───────── materials ─────────
 const MAT = { FLUID: 0, SOLID: 1, POROUS: 2, CANOPY: 3, SEDIMENT: 4 };
 const GRAIN = [
-  { label: 'fine sand', d: 0.0002, color: [214, 193, 150] },
-  { label: 'coarse sand', d: 0.001, color: [190, 150, 88] },
-  { label: 'gravel', d: 0.01, color: [132, 120, 106] },
+  // muted, matte greys on the black stage (warm for sand, neutral for gravel); the classes still
+  // read apart by tone and by grain texture
+  { label: 'fine sand', d: 0.0002, color: [118, 111, 99] },
+  { label: 'coarse sand', d: 0.001, color: [94, 86, 74] },
+  { label: 'gravel', d: 0.01, color: [104, 105, 108] },
 ];
 // props: [key, label, min, max, step, lab default, field default]
 const MAT_INFO = {

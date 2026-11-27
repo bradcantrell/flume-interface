@@ -49,7 +49,7 @@ const SCENES = {
     if (i < 0 || k < 0 || i >= nx || k >= nz) continue;
     const m = S.paint(x, z), hsh = (Math.sin(i * 127.1 + k * 311.7) * 43758.5453) % 1;
     if (m === 1) { const n = hsh * 10; mat[o] = 70 + n; mat[o + 1] = 76 + n; mat[o + 2] = 84 + n; mat[o + 3] = 255; }
-    else if (m === 4) { const n = hsh * 16; mat[o] = 214 + n; mat[o + 1] = 193 + n; mat[o + 2] = 150 + n; mat[o + 3] = 255; }
+    else if (m === 4) { const n = hsh * 16; mat[o] = 118 + n; mat[o + 1] = 111 + n; mat[o + 2] = 99 + n; mat[o + 3] = 255; }
   }
   // offscreen target and readback
   const fmt = 'rgba8unorm', tex = M.device.createTexture({ size: [W, H], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });

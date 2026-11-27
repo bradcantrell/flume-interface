@@ -613,8 +613,9 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
         } else if (dt > 0.0) {
           if (dry) { vz -= prm.g*dt; vx *= (1.0 - 0.5*dt); x += vx*dt; z += vz*dt; }
           else if (wet) { let v = vel(x, z); let rise = 0.04*sqrt(prm.g*h0);
-            // bubbles dragged deep dissolve quickly, so foam stays near the surface instead of hanging in curtains
-            let sub = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - z; age += dt*4.0*smoothstep(0.15, 0.5, sub/h0);
+            // bubbles dragged a few cells under dissolve quickly, so foam stays a surface feature instead of
+            // hanging in curtains or tracing the eddies of a breaker
+            let sub = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - z; age += dt*(4.0*smoothstep(0.15, 0.5, sub/h0) + 8.0*smoothstep(2.0*prm.dx, 6.0*prm.dx, sub));
             vx = v.x; vz = v.y + rise; x += vx*dt; z += vz*dt; if (z > eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)]) { z = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - 0.2*prm.dx; } }
         }
       }
@@ -833,12 +834,16 @@ struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32,
   return vec4f(p[i], 0.0, 1.0);
 }
 // local surface above row k in column i: (height, found) from the first non-solid air cell upward
+// (eta is the topmost water in the column, so spray above would make the colour jump between columns)
 fn surfAt(i:i32, k:i32) -> vec2f {
   let nx = i32(V0.nx); let nz = i32(V0.nz); var kk = k;
-  for (var q = 0; q < 16; q++) {
+  // single cells for the first 16, then every second cell up to 64 (deep water changes colour slowly)
+  for (var q = 0; q < 40; q++) {
     if (kk >= nz) { return vec2f(f32(nz)*V0.dx, 1.0); }
-    let c = u32(i + nx*kk); if (solid[c] == 0u && f[c] < 0.5) { return vec2f((f32(kk) + clamp(f[c], 0.0, 0.5))*V0.dx, 1.0); }
-    kk += 1;
+    let c = u32(i + nx*kk); let ca = u32(i + nx*min(kk + 1, nz - 1));
+    // an air cell with water above it is a trapped pocket, not the surface: look past it
+    if (solid[c] == 0u && f[c] < 0.5 && (kk + 1 >= nz || f[ca] < 0.5 || solid[ca] != 0u)) { return vec2f((f32(kk) + clamp(f[c], 0.0, 0.5))*V0.dx, 1.0); }
+    kk += select(2, 1, q < 16);
   }
   return vec2f(0.0, 0.0);
 }
@@ -870,12 +875,12 @@ fn smp(i:i32, k:i32) -> f32 {
   let gxe = clamp(x / V0.dx - 0.5, 0.0, V0.nx - 1.0); let ie0 = u32(floor(gxe)); let ie1 = min(ie0 + 1u, u32(nx - 1));
   let e0 = eta[ie0]; let e1 = eta[ie1]; let ae = gxe - f32(ie0);
   let e = select(select(mix(e0, e1, ae), e0, e1 < 0.0), e1, e0 < 0.0);
-  // depth under the surface measured locally: up from this row to the first air cell (at most 16
+  // depth under the surface measured locally: up from this row to the first air cell (at most 64
   // cells) in the two nearest columns, with that cell's fill as the fraction, blended across, so spray
   // or a broken surface above does not make the colour jump and there are no column stripes
   let gxs = clamp(x / V0.dx - 0.5, 0.0, V0.nx - 1.0); let cs0 = i32(floor(gxs)); let cs1 = min(cs0 + 1, nx - 1);
   let sf0 = surfAt(cs0, ck); let sf1 = surfAt(cs1, ck); let as_ = gxs - f32(cs0);
-  var zs = max(e, z + 16.0*V0.dx);
+  var zs = max(e, z + 64.0*V0.dx);
   if (sf0.y > 0.5 && sf1.y > 0.5) { zs = mix(sf0.x, sf1.x, as_); } else if (sf0.y > 0.5) { zs = sf0.x; } else if (sf1.y > 0.5) { zs = sf1.x; }
   let d = max(zs - z, 0.0);
   let t = clamp(d / V0.depthRef, 0.0, 1.0);
@@ -895,14 +900,7 @@ fn smp(i:i32, k:i32) -> f32 {
   // dye
   let dv = dye[cc];
   col = mix(col, vec3f(0.95, 0.30, 0.55), clamp(dv*1.4, 0.0, 0.92));
-  // foam: fast shear near the surface (jumps, breaking waves, nappes)
-  let W1 = u32(nx + 1); let ci1 = u32(clamp(ci, 1, nx - 2)); let ck1 = u32(clamp(ck, 1, nz - 2));
-  let dudz = (u[ci1 + W1*(ck1 + 1u)] - u[ci1 + W1*(ck1 - 1u)]) / (2.0*V0.dx);
-  let dwdx = (w[ci1 + 1u + u32(nx)*ck1] - w[ci1 - 1u + u32(nx)*ck1]) / (2.0*V0.dx);
-  let shear = abs(dudz) + abs(dwdx);
-  let nearSurf = 1.0 - clamp(d / (4.0*V0.dx), 0.0, 1.0);
-  let foam = clamp((shear - 6.0) / 14.0, 0.0, 1.0) * nearSurf;
-  col = mix(col, vec3f(0.93, 0.97, 1.0), foam*0.75);
+  // (foam is drawn by the particles; a per-cell tint here showed the grid as squares)
   // bright line along the free surface
   let hl = 1.0 - clamp(abs(fv - 0.5) / (dfv*1.6), 0.0, 1.0);
   col = mix(col, vec3f(0.80, 0.95, 1.0), hl*0.7);
@@ -923,7 +921,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   if (age < 0.0) { out.pos = vec4f(2.0, 2.0, 0.0, 1.0); out.col = vec4f(0.0); out.t = 0.0; return out; }
   let hx = (x - V0.x0)*V0.s; let hy = V0.ch - (z - V0.z0)*V0.s*V0.ve;
   let foam = kind > 0.5;
-  let trail = select(0.10, 0.05, foam);                       // seconds of path behind the head
+  let trail = select(0.06, 0.05, foam);                       // seconds of path behind the head
   var tx = hx - vx*trail*V0.s; var ty = hy + vz*trail*V0.s*V0.ve;
   var d = vec2f(hx - tx, hy - ty); var len = length(d);
   let maxLen = select(10.0, 6.0, foam)*V0.dpr;
@@ -939,7 +937,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   out.t = cc.x;
   if (!foam) {
     let sp = clamp(length(vec2f(vx, vz))/max(V0.umax, 0.05), 0.0, 1.0);
-    out.col = vec4f(mix(vec3f(0.20, 0.45, 0.80), vec3f(0.70, 0.90, 1.0), sp), 0.05 + 0.30*sp);
+    out.col = vec4f(mix(vec3f(0.20, 0.45, 0.80), vec3f(0.55, 0.80, 1.0), sp), 0.04 + 0.12*sp);   // a faint texture, not loops
   } else {
     out.col = vec4f(1.0, 1.0, 1.0, 0.9*clamp(1.0 - age/3.0, 0.0, 1.0));
   }
