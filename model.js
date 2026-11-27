@@ -560,7 +560,8 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
     partStep: K([['u', 'f'], ['w', 'f'], ['f', 'f'], ['solid', 'u'], ['eta', 'f'], ['PT', 'f'], ['PU', 'U']], `let nT = u32(spv(3u)); let nF = u32(spv(4u)); if (c >= nT + nF) {return;}
       let dt = spv(0u); let o = 8u*c; let kind = select(0u, 1u, c >= nT);
       var x = PT[o]; var z = PT[o+1u]; var vx = PT[o+4u]; var vz = PT[o+5u]; var age = PT[o+6u];
-      var sd = c*747796405u + u32(spv(2u))*2891336453u + 12345u;
+      let px0 = x; let pz0 = z; var fresh = false;      // where it was; fresh = born this step (no line drawn)
+      var sd = c*747796405u + u32(spv(2u))*2891336453u + 12345u + u32(spv(6u))*2654435761u;
       let life = select(2.5 + 3.5*rnd(&sd), 1.0 + 2.0*rnd(&sd), kind == 1u);
       let L = f32(prm.nx)*prm.dx; let Hd = f32(prm.nz)*prm.dx; let h0 = max(spv(5u), prm.dx);
       if (age >= 0.0) { age += dt; }
@@ -569,7 +570,7 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
       if (kind == 0u) {
         if (age < 0.0 || age > life || !wet) {
           // reborn at a random water cell (a few tries)
-          age = -1.0;
+          age = -1.0; fresh = true;
           for (var t = 0u; t < 4u; t++) {
             let xi = rnd(&sd)*L; let zi = rnd(&sd)*Hd; let ci = cellOf(xi, zi);
             if (solid[ci] == 0u && fAt2(xi, zi) >= 0.5) { x = xi; z = zi; age = 0.0; break; }
@@ -581,7 +582,7 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
         }
       } else {
         if (age < 0.0 || age > life || !inside || (inside && solid[cl] != 0u)) {
-          age = -1.0;
+          age = -1.0; fresh = true;
           // try to be born: a random column, at its surface or somewhere in the water below it
           let i = min(u32(rnd(&sd)*f32(prm.nx)), prm.nx - 1u); let e = eta[i];
           if (e > 0.0 && dt > 0.0) {
@@ -619,7 +620,7 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
             vx = v.x; vz = v.y + rise; x += vx*dt; z += vz*dt; if (z > eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)]) { z = eta[min(u32(max(x/prm.dx, 0.0)), prm.nx - 1u)] - 0.2*prm.dx; } }
         }
       }
-      PT[o] = x; PT[o+1u] = z; PT[o+4u] = vx; PT[o+5u] = vz; PT[o+6u] = age; PT[o+7u] = f32(kind);`,
+      PT[o] = x; PT[o+1u] = z; PT[o+2u] = select(px0, x, fresh); PT[o+3u] = select(pz0, z, fresh); PT[o+4u] = vx; PT[o+5u] = vz; PT[o+6u] = age; PT[o+7u] = f32(kind);`,
       SAMPLE + `fn rnd(s: ptr<function, u32>) -> f32 { *s = *s*747796405u + 2891336453u; var r = ((*s >> ((*s >> 28u) + 4u)) ^ *s)*277803737u; r = (r >> 22u) ^ r; return f32(r)/4294967295.0; }
 fn cellOf(x:f32, z:f32) -> u32 { let i = u32(clamp(x/prm.dx, 0.0, f32(prm.nx) - 1.0)); let k = u32(clamp(z/prm.dx, 0.0, f32(prm.nz) - 1.0)); return i + prm.nx*k; }
 fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
@@ -953,6 +954,47 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
 @fragment fn fs(in: VO) -> @location(0) vec4f { let a = in.col.a*in.t; return vec4f(in.col.rgb*a, a); }
 `;
 
+  // Long exposure (after Prandtl's and Van Dyke's flake photographs): every frame the exposure image
+  // fades by exp(-dt/T) and each particle's step is added as a thin line, so slow water, where flakes
+  // linger, exposes brighter, and fast water draws long faint streaks. T is the exposure time.
+  const FS_TRI = `@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0)); return vec4f(p[i], 0.0, 1.0); }`;
+  const EXP_FADE = FS_TRI + `
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> S: vec4f;
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return textureLoad(src, vec2i(pos.xy), 0) * S.x; }`;
+  const EXP_LINE = `
+struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32, nz:f32, mode:f32, H:f32, time:f32, umax:f32, depthRef:f32, dpr:f32 };
+@group(0) @binding(0) var<uniform> V0: V;
+@group(0) @binding(1) var<storage, read> P: array<f32>;
+@group(0) @binding(2) var<uniform> S: vec4f;
+struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  let o = 8u*ii; var out: VO; out.a = 0.0;
+  if (P[o+6u] < 0.0) { out.pos = vec4f(2.0, 2.0, 0.0, 1.0); return out; }
+  let hx = (P[o] - V0.x0)*V0.s; let hy = V0.ch - (P[o+1u] - V0.z0)*V0.s*V0.ve;
+  let tx = (P[o+2u] - V0.x0)*V0.s; let ty = V0.ch - (P[o+3u] - V0.z0)*V0.s*V0.ve;
+  var d = vec2f(hx - tx, hy - ty); var len = length(d);
+  if (len > 60.0*V0.dpr) { out.pos = vec4f(2.0, 2.0, 0.0, 1.0); return out; }
+  let mn = 0.75*V0.dpr; var dir = vec2f(1.0, 0.0); if (len > 1e-3) { dir = d/len; }
+  let ext = max(len, mn); let nrm = vec2f(-dir.y, dir.x); let hw = 0.5*V0.dpr;
+  let corners = array<vec2f, 6>(vec2f(0.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+  let cc = corners[vi];
+  let p = vec2f(tx, ty) + dir*ext*cc.x + nrm*hw*cc.y;
+  out.pos = vec4f(p.x/V0.cw*2.0 - 1.0, 1.0 - p.y/V0.ch*2.0, 0.0, 1.0);
+  out.a = S.y * mn / ext;          // the same light per step, spread over the length it travelled
+  return out;
+}
+@fragment fn fs(in: VO) -> @location(0) vec4f { return vec4f(in.a, in.a, in.a, in.a); }`;
+  const EXP_SHOW = FS_TRI + `
+@group(0) @binding(0) var acc: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> S: vec4f;
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let a = textureLoad(acc, vec2i(pos.xy), 0).r;
+  let l = 1.0 - exp(-a*S.z);
+  let col = mix(vec3f(0.45, 0.72, 1.0), vec3f(0.95, 0.98, 1.0), l)*l*0.95;
+  return vec4f(col, l*0.95);
+}`;
+
   // ───────────────────────── wave theory ─────────────────────────
   function waveNumber(omega, h) {           // omega^2 = g k tanh(k h)
     let k = omega * omega / G; if (h <= 0) return k;
@@ -1121,13 +1163,15 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), PS: buf(8 * Math.max(20000, Math.min(150000, Math.round(N * 0.6)))), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx), egl: buf(3 * nx),
     };
     const P0 = ubuf();
     const SPU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const DIU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const PU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const PU2 = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const nS = Math.max(20000, Math.min(150000, Math.round(N * 0.6)));
     const nT = Math.max(3000, Math.min(20000, Math.round(N / 10))), nF = 16000;
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
     while (L[L.length - 1].nx > 8 && L[L.length - 1].nz > 4) {
@@ -1169,6 +1213,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       dyeAdv: D('dyeAdv', P0, [B.u, B.w, B.typ, B.dye, B.dye2], N),
       dyeInject: D('dyeInject', P0, [B.f, B.solid, B.dye, DIU], N),
       partStep: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.P, PU], nT + nF),
+      partStepS: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.PS, PU2], nS),
       plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
@@ -1195,7 +1240,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, SPU, DIU, PU, nT, nF, N, NU, NW, all: all.concat([P0, SPU, DIU, PU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, DIU, PU, PU2, nT, nF, nS, N, NU, NW, all: all.concat([P0, SPU, DIU, PU, PU2], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -1309,7 +1354,9 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
     // result when they land, so a restart is not painted over by the bed or surface it replaced
     M.gen++;
     M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0]; M.colHost = null;
-    if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz); }
+    if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz);
+      const ps = new Float32Array(8 * M.S.nS); for (let j = 0; j < M.S.nS; j++) ps[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.PS, 0, ps); }
+    M.expClear = true;
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
@@ -1455,8 +1502,12 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
   M.stepParticles = function (dtp) {
     if (!M.ok || !M.S || M.particles === false) return;
     M.pFrame = (M.pFrame || 0) + 1;
-    M.device.queue.writeBuffer(M.S.PU, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nT, M.S.nF, Math.max(M.p.h0 - (M.P ? M.P.zin : 0), M.grid.dx), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
-    const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.partStep); ps.end(); M.device.queue.submit([e.finish()]);
+    const hh = Math.max(M.p.h0 - (M.P ? M.P.zin : 0), M.grid.dx);
+    M.device.queue.writeBuffer(M.S.PU, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nT, M.S.nF, hh, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.partStep);
+    if (M.streak) { M.device.queue.writeBuffer(M.S.PU2, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nS, 0, hh, 7919, 0, 0, 0, 0, 0, 0, 0, 0, 0])); run(ps, M.S.d.partStepS); }
+    ps.end(); M.device.queue.submit([e.finish()]);
+    M.pAdvance = (M.pAdvance || 0) + dtp;          // model time the exposure has to take in at the next draw
   };
   // dye tool: release dye in a disc at (x, z) of radius r (m)
   M.injectDye = function (x, z, r) {
@@ -1613,12 +1664,57 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       g.nz * g.dx, M.t, Math.max(M.vmax, 0.05), Math.max(M.p.h0, g.dx), r]);
     M.device.queue.writeBuffer(M.render_.U, 0, v);
     const enc = M.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({ colorAttachments: [{ view: (view.target || M.ctx.getCurrentTexture()).createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
+    const tgt = view.target || M.ctx.getCurrentTexture();
+    const exp = M.streak ? exposurePass(enc, view, tgt.width, tgt.height) : null;
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: tgt.createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
     pass.setPipeline(M.render_.p); pass.setBindGroup(0, M.render_.bg); pass.draw(3);
-    if (M.particles !== false) { pass.setPipeline(M.render_.pp); pass.setBindGroup(0, M.render_.pbg); const k = M.drawKinds; pass.draw(6, k === 'tracers' ? M.S.nT : k === 'foam' ? M.S.nF : M.S.nT + M.S.nF, 0, k === 'foam' ? M.S.nT : 0); }
+    if (exp) { pass.setPipeline(exp.p); pass.setBindGroup(0, exp.bg); pass.draw(3); }
+    if (M.particles !== false) {
+      // with the exposure on, its flakes replace the tracers; foam stays
+      const k = exp ? 'foam' : M.drawKinds;
+      pass.setPipeline(M.render_.pp); pass.setBindGroup(0, M.render_.pbg); pass.draw(6, k === 'tracers' ? M.S.nT : k === 'foam' ? M.S.nF : M.S.nT + M.S.nF, 0, k === 'foam' ? M.S.nT : 0);
+    }
     pass.end();
     M.device.queue.submit([enc.finish()]);
   };
+  // the exposure image: two float textures at the target's size, ping-ponged; cleared when the view
+  // changes (it is drawn in screen space) or the flume restarts
+  let EX = null;
+  M.exposure = 1.0;
+  function exposurePass(enc, view, W, H) {
+    const dev = M.device, fmt = 'rgba16float';
+    if (!EX || EX.W !== W || EX.H !== H || EX.fmt !== M.format) {
+      if (EX) for (const t of EX.tex) t.destroy();
+      const mk = () => dev.createTexture({ size: [W, H], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+      const U = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const fm = dev.createShaderModule({ code: EXP_FADE }), lm = dev.createShaderModule({ code: EXP_LINE }), sm = dev.createShaderModule({ code: EXP_SHOW });
+      const add = { color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' } };
+      const fade = dev.createRenderPipeline({ layout: 'auto', vertex: { module: fm, entryPoint: 'vs' }, fragment: { module: fm, entryPoint: 'fs', targets: [{ format: fmt }] }, primitive: { topology: 'triangle-list' } });
+      const line = dev.createRenderPipeline({ layout: 'auto', vertex: { module: lm, entryPoint: 'vs' }, fragment: { module: lm, entryPoint: 'fs', targets: [{ format: fmt, blend: add }] }, primitive: { topology: 'triangle-list' } });
+      const show = dev.createRenderPipeline({ layout: 'auto', vertex: { module: sm, entryPoint: 'vs' }, fragment: { module: sm, entryPoint: 'fs', targets: [{ format: M.format, blend: add }] }, primitive: { topology: 'triangle-list' } });
+      const tex = [mk(), mk()];
+      const fadeBG = tex.map((t) => dev.createBindGroup({ layout: fade.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: { buffer: U } }] }));
+      const showBG = tex.map((t) => dev.createBindGroup({ layout: show.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: { buffer: U } }] }));
+      const lineBG = dev.createBindGroup({ layout: line.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: M.render_.U } }, { binding: 1, resource: { buffer: M.S.B.PS } }, { binding: 2, resource: { buffer: U } }] });
+      EX = { W, H, fmt: M.format, tex, U, fade, line, show, fadeBG, showBG, lineBG, cur: 0, key: '', buf: M.S.B.PS };
+      M.expClear = true;
+    }
+    if (EX.buf !== M.S.B.PS) { EX.lineBG = dev.createBindGroup({ layout: EX.line.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: M.render_.U } }, { binding: 1, resource: { buffer: M.S.B.PS } }, { binding: 2, resource: { buffer: EX.U } }] }); EX.buf = M.S.B.PS; M.expClear = true; }
+    const key = [view.x0, view.z0, view.s, view.ve, view.cw, view.ch, view.dpr].join(',');
+    if (key !== EX.key) { EX.key = key; M.expClear = true; }
+    const T = Math.max(M.exposure || 1, 0.02), adv = M.pAdvance || 0; M.pAdvance = 0;
+    // light is added per model second (a particle crossing a pixel slowly exposes it more, as on film);
+    // the exposure time sets how long light stays, and the tone curve keeps long exposures from burning out
+    const decay = M.expClear ? 0 : Math.exp(-adv / T), k = (M.expLight || 40) * adv, gain = (M.expGain || 2.0) * 0.12 / (0.07 + T);    // stop down as the exposure lengthens
+    M.expClear = false;
+    dev.queue.writeBuffer(EX.U, 0, new Float32Array([decay, k, gain, 0]));
+    const src = EX.cur, dst = 1 - src; EX.cur = dst;
+    const p = enc.beginRenderPass({ colorAttachments: [{ view: EX.tex[dst].createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
+    p.setPipeline(EX.fade); p.setBindGroup(0, EX.fadeBG[src]); p.draw(3);
+    p.setPipeline(EX.line); p.setBindGroup(0, EX.lineBG); p.draw(6, M.S.nS);
+    p.end();
+    return { p: EX.show, bg: EX.showBG[dst] };
+  }
   let rb = null;
   function renderReadback(view) {
     if (!M.rbCtx || (rb && rb.busy)) return;

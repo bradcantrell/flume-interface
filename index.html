@@ -92,8 +92,10 @@
     <div class="toggles" id="view-toggles">
       <button data-view="levels" class="on" title="Named water levels and the crests of what you drew">levels</button>
       <button data-view="energy" class="on" title="River: the energy line, critical depth and where energy is lost. Waves: the mean water level">energy</button>
+      <button data-view="streak" title="Long exposure: fine flakes carried by the water, exposed over a time you set, like a flow photograph">streak</button>
       <button data-view="grid" title="Elevation and distance marks with a faint metric grid">grid</button>
     </div>
+    <div class="row" id="exposure-row" hidden><label for="exposure">exposure <span id="exposure-val"></span></label><input id="exposure" type="range" min="0" max="100" step="1" value="30" title="Short: the flow at this instant (eddies). Long: where the water goes on average"></div>
 
     <h2>Water</h2>
     <div id="model-controls"></div>
@@ -743,7 +745,15 @@ function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m 
 function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
 
 let showGrid = false;
-const VIEW = { levels: true, energy: true, grid: false };
+const VIEW = { levels: true, energy: true, streak: false, grid: false };
+// exposure slider: 0.02 s to 3 s on a log scale
+function exposureFromSlider(v) { return 0.02 * Math.pow(150, v / 100); }
+function applyExposure() {
+  const T = exposureFromSlider(+document.getElementById('exposure').value);
+  document.getElementById('exposure-val').textContent = T < 1 ? T.toFixed(2) + ' s' : T.toFixed(1) + ' s';
+  if (model) { model.exposure = T; model.streak = VIEW.streak; }
+  document.getElementById('exposure-row').hidden = !VIEW.streak;
+}
 function drawBackground() {
   const c = bgCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0);
   // pure black, so the water and particles carry the picture; a faint metric grid on request
@@ -1242,7 +1252,8 @@ function wire() {
   $('len').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ L: v }); else syncDomainInputs(); });
   $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
   // view toggles (like the sediment interface's): each button switches one layer of the drawing
-  for (const b of document.querySelectorAll('#view-toggles button')) b.addEventListener('click', () => { const k = b.dataset.view; VIEW[k] = !VIEW[k]; b.classList.toggle('on', VIEW[k]); if (k === 'grid') showGrid = VIEW.grid; });
+  for (const b of document.querySelectorAll('#view-toggles button')) b.addEventListener('click', () => { const k = b.dataset.view; VIEW[k] = !VIEW[k]; b.classList.toggle('on', VIEW[k]); if (k === 'grid') showGrid = VIEW.grid; if (k === 'streak') applyExposure(); });
+  $('exposure').addEventListener('input', applyExposure); applyExposure();
   $('bedstyle').addEventListener('change', (e) => { bedStyle = e.target.value; });
   $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
   $('run').addEventListener('click', () => setRunning(!running));

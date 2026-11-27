@@ -1,6 +1,6 @@
 // Render a scene on the GPU (Dawn) to PNG frames and an MP4, for reviewing the look on real hardware.
 //   node dev/render_movie.js <scene: jump|waves> <out dir> [seconds] [fps]
-//   env: WARM (s of spin-up, default 4), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
+//   env: WARM (s of spin-up, default 4), STREAK=<exposure s> (long exposure on), LIGHT, GAIN (its tuning), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
 // Water and particles come from model.js's renderer (offscreen); solids and sediment are drawn on the
 // CPU the way the page draws them (black background, sand, grey solids), then ffmpeg makes the MP4.
 'use strict';
@@ -59,6 +59,7 @@ const SCENES = {
   const bpr = Math.ceil(W * 4 / 256) * 256, rb = M.device.createBuffer({ size: bpr * H, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   M.format = fmt; M.render_ = null;
   const parts = process.env.PARTS; if (parts === 'none') M.particles = false;
+  if (process.env.STREAK) { M.streak = true; M.exposure = +process.env.STREAK; if (process.env.LIGHT) M.expLight = +process.env.LIGHT; if (process.env.GAIN) M.expGain = +process.env.GAIN; }
   else if (parts) M.drawKinds = parts;
   const dt = 0.4 * dx / 1.5, perFrame = 1 / fps, warm = +(process.env.WARM || 4);
   let frame = 0;
@@ -67,9 +68,11 @@ const SCENES = {
     await M.debug.steps(n, dt);
     M.stepParticles(n * dt);                     // the particles move by this frame's model time
     if (t < 0) { if (process.env.SECTION && frame % 1 === 0) await M.debug.readColumns(); continue; }
-    if (process.env.FRAMES && !process.env.FRAMES.split(',').includes(String(frame))) { frame++; continue; }
+    const skip = process.env.FRAMES && !process.env.FRAMES.split(',').includes(String(frame));
+    if (skip && !M.streak) { frame++; continue; }
     if (process.env.SECTION) { M.wantSection = true; await M.debug.readColumns(); fs.writeFileSync(path.join(out, 's' + String(frame).padStart(5, '0') + '.json'), JSON.stringify(M.sectionLines())); }
     M.render(Object.assign({}, view, { target: tex, _rb: true }));
+    if (skip) { await M.device.queue.onSubmittedWorkDone(); frame++; continue; }
     const e = M.device.createCommandEncoder(); e.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: bpr }, [W, H]); M.device.queue.submit([e.finish()]);
     await rb.mapAsync(GPUMapMode.READ); const src = new Uint8Array(rb.getMappedRange());
     const img = Buffer.alloc(W * H * 4);

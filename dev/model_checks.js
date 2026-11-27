@@ -397,6 +397,9 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('dye is carried by the flow and its total is kept (within 1% over 15 s)', a.m > 0 && Math.abs(b.m / a.m - 1) < 0.01, 'total ' + (100 * (b.m / a.m - 1)).toFixed(3) + '%, centre moved ' + ((b.cx - a.cx) * 100).toFixed(1) + ' cm');
     const rerr2 = await M.debug.validateRender(400, 200);
     check('the water renderer (with dye, plumes and foam) builds and draws', !rerr2, rerr2);
+    M.streak = true; M.exposure = 0.5; for (let j = 0; j < 5; j++) { M.stepParticles(0.02); }
+    const rerr3 = await M.debug.validateRender(400, 200); M.streak = false;
+    check('the long exposure (flakes, fading image, tone curve) builds and draws', !rerr3, rerr3);
   }
 
   // 23. restart: a river with a moving bed, dye and suspended sand, then reset with a bed readback in

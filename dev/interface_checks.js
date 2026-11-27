@@ -53,8 +53,10 @@ function parseInto(htmlText) {
   }
 }
 const toolButtons = [...html.matchAll(/data-tool="(\w+)"/g)].map(m => { const b = makeEl('', 'button'); b.dataset.tool = m[1]; return b; });
+const viewButtons = [...html.matchAll(/data-view="(\w+)"/g)].map(m => { const b = makeEl('', 'button'); b.dataset.view = m[1]; return b; });
 function queryAll(sel, within) {
   if (sel === '#toolbar button') return toolButtons;
+  if (sel === '#view-toggles button') return viewButtons;
   if (sel === '[data-k]') return dataKeyed.filter(e => within && within._html.includes('id="' + e.id + '"'));
   if (sel.startsWith('.')) return Object.values(els).filter(e => e.classList.contains(sel.slice(1)));
   return [];
@@ -244,6 +246,12 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const sb = viewButtons.find(b => b.dataset.view === 'streak'), M0 = T.model;
+    sb.click(); const on = M0.streak === true && getEl('exposure-row').hidden === false;
+    getEl('exposure').value = '100'; getEl('exposure').dispatch('input'); const tl = M0.exposure;
+    getEl('exposure').value = '0'; getEl('exposure').dispatch('input'); const ts = M0.exposure;
+    sb.click();
+    check('the streak toggle turns the long exposure on and shows the exposure slider (0.02 s to 3 s)', on && Math.abs(tl - 3) < 1e-9 && Math.abs(ts - 0.02) < 1e-9 && M0.streak === false && getEl('exposure-row').hidden === true); }
   { const n = T.scene.shapes.length, r0 = C.reset;
     if (!n) T.scene.shapes.push({ id: 999, kind: 'rect', pts: [[1, 0.2], [2, 0.4]], mat: 1, props: {} });
     getEl('clear').click();
