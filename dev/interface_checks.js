@@ -208,7 +208,7 @@ const run = (code) => vm.runInContext(code, sandbox);
   const [, vz] = T.s2w(400, 300); T.setVE(400, 300, 2); const [, vz2] = T.s2w(400, 300);
   check('changing the vertical scale keeps the height under the pointer', Math.abs(vz - vz2) < 1e-9);
   T.onKey({ key: '0', target: {}, preventDefault() {} });
-  check('0 fits the view again', Math.abs(T.view.s - v.cw / (20 * 1.04)) < 1e-9);
+  check('0 fits the view again', Math.abs(T.view.s - (v.cw - 70) / 20) < 1e-9);
 
   // 8. save, open, damaged files
   T.setTool('select');

@@ -19,15 +19,16 @@ function png(file, W, H, rgba) {
 const SCENES = {
   // a sluice gate and a hydraulic jump, then a sill downstream
   jump: { L: 8, H: 0.6, dx: 0.01, p: { type: 'river', h0: 0.07, q: 0.10, hout: 0.19, sediment: false },
-    paint: (x, z) => (z < 0.02 ? 1 : (x < 0.15 && z > 0.06) ? 1 : (x > 5.6 && x < 5.9 && z < 0.10) ? 1 : 0), view: { x0: 1.0, z0: -0.005, L: 4.6, ve: 3 } },
+    paint: (x, z) => (z < 0.02 ? 1 : (x < 0.15 && z > 0.06) ? 1 : (x > 5.6 && x < 5.9 && z < 0.10) ? 1 : 0), view: { x0: -0.12, z0: -0.025, L: 4.8, ve: 3, H: 440 } },
   // waves over a submerged reef breaking on a sand beach
   waves: { L: 20, H: 1.0, dx: 0.0125, p: { type: 'wave', h0: 0.45, H: 0.12, T: 2.2, farEnd: 'beach', absorb: true, sediment: false },
-    paint: (x, z) => { const bed = x < 9 ? 0.06 : 0.06 + (x - 9) * 0.07; if (z < bed) return 4; if (x > 6.5 && x < 7.8 && z < 0.32 - Math.abs(x - 7.15) * 0.3) return 1; return 0; }, view: { x0: 4.5, z0: 0.0, L: 15, ve: 3 } },
+    paint: (x, z) => { const bed = x < 9 ? 0.06 : 0.06 + (x - 9) * 0.07; if (z < bed) return 4; if (x > 6.5 && x < 7.8 && z < 0.32 - Math.abs(x - 7.15) * 0.3) return 1; return 0; }, view: { x0: 5.2, z0: -0.04, L: 10.8, ve: 3, H: 400 } },
 };
 
 (async () => {
   const which = process.argv[2] || 'jump', out = process.argv[3], secs = +(process.argv[4] || 12), fps = +(process.argv[5] || 30);
   const S = SCENES[which]; fs.mkdirSync(out, { recursive: true });
+  if (process.env.VIEWJSON) fs.writeFileSync(process.env.VIEWJSON, JSON.stringify(S.view));
   const { create, globals } = await import('webgpu'); Object.assign(globalThis, globals);
   let M = null; globalThis.registerModel = (m) => { M = m; };
   vm.runInThisContext(fs.readFileSync(path.join(__dirname, '..', 'model.js'), 'utf8'), { filename: 'model.js' });
@@ -41,15 +42,17 @@ const SCENES = {
     if (m) { r.mat[i + nx * k] = m; r.frac[i + nx * k] = n / 16; }
   }
   M.setScale('lab'); Object.assign(M.p, S.p); M.setGrid({ nx, nz, dx }, r); M.reset();
-  const W = 1600, H = +(process.env.H || 480), v = S.view, sc = W / v.L, view = { x0: v.x0, z0: v.z0, s: sc, ve: v.ve, cw: W, ch: H, dpr: 1 };
+  const W = 1600, H = +(process.env.H || S.view.H || 480), v = S.view, sc = W / v.L, view = { x0: v.x0, z0: v.z0, s: sc, ve: v.ve, cw: W, ch: H, dpr: 1 };
   // solids and sand, drawn once (black where not solid), as the page would
-  const mat = new Uint8ClampedArray(W * H * 4);
+  // the section cut, as the page draws it: nothing inside solids and sediment (black), a pink line on their edge
+  const inS = new Uint8Array(W * H), mat = new Uint8ClampedArray(W * H * 4);
+  for (let py = 0; py < H; py++) for (let px = 0; px < W; px++) inS[px + W * py] = S.paint(v.x0 + (px + 0.5) / sc, v.z0 + (H - py - 0.5) / (sc * v.ve)) ? 1 : 0;
   for (let py = 0; py < H; py++) for (let px = 0; px < W; px++) {
-    const x = v.x0 + px / sc, z = v.z0 + (H - py) / (sc * v.ve), i = Math.floor(x / dx), k = Math.floor(z / dx), o = 4 * (px + W * py);
-    if (i < 0 || k < 0 || i >= nx || k >= nz) continue;
-    const m = S.paint(x, z), hsh = (Math.sin(i * 127.1 + k * 311.7) * 43758.5453) % 1;
-    if (m === 1) { const n = hsh * 10; mat[o] = 70 + n; mat[o + 1] = 76 + n; mat[o + 2] = 84 + n; mat[o + 3] = 255; }
-    else if (m === 4) { const n = hsh * 16; mat[o] = 118 + n; mat[o + 1] = 111 + n; mat[o + 2] = 99 + n; mat[o + 3] = 255; }
+    const o = 4 * (px + W * py), me = inS[px + W * py];
+    let edge = false;
+    for (let dy = -1; dy <= 1 && !edge; dy++) for (let dx2 = -1; dx2 <= 1; dx2++) { const qx = px + dx2, qy = py + dy; if (qx >= 0 && qy >= 0 && qx < W && qy < H && inS[qx + W * qy] !== me) { edge = true; break; } }
+    if (edge) { mat[o] = 255; mat[o + 1] = 46; mat[o + 2] = 147; mat[o + 3] = 255; }
+    else if (me) { mat[o + 3] = 255; }
   }
   // offscreen target and readback
   const fmt = 'rgba8unorm', tex = M.device.createTexture({ size: [W, H], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
@@ -79,7 +82,7 @@ const SCENES = {
     rb.unmap();
     png(path.join(out, 'f' + String(frame++).padStart(5, '0') + '.png'), W, H, img);
   }
-  if (!process.env.FRAMES) cp.execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-framerate', String(fps), '-i', path.join(out, 'f%05d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', path.join(out, which + '.mp4')]);
+  if (!process.env.FRAMES && !process.env.NOVIDEO) cp.execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-framerate', String(fps), '-i', path.join(out, 'f%05d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', path.join(out, which + '.mp4')]);
   console.log('wrote', frame, 'frames and', path.join(out, which + '.mp4'));
   process.exit(0);
 })();

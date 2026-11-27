@@ -899,7 +899,7 @@ fn smp(i:i32, k:i32) -> f32 {
   col = mix(col, vec3f(0.62, 0.50, 0.33), clamp(sqrt(sc/0.004), 0.0, 0.85));
   // dye
   let dv = dye[cc];
-  col = mix(col, vec3f(0.95, 0.30, 0.55), clamp(dv*1.4, 0.0, 0.92));
+  col = mix(col, vec3f(1.0, 0.62, 0.14), clamp(dv*1.4, 0.0, 0.92));     // amber (pink is the section cut)
   // (foam is drawn by the particles; a per-cell tint here showed the grid as squares)
   // bright line along the free surface
   let hl = 1.0 - clamp(abs(fv - 0.5) / (dfv*1.6), 0.0, 1.0);

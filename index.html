@@ -278,10 +278,10 @@ let view = { x0: 0, z0: 0, s: 50, ve: 1, cw: 800, ch: 400, dpr: 1 };
 let viewFitted = true;
 function fitView() {
   const { L, H } = DOMAIN, cw = view.cw, ch = view.ch;
-  const s = cw / (L * 1.04);
+  const s = (cw - 70) / L;                                          // 54 px on the left for the elevation marks
   const ve = Math.max(1, Math.min(3, (ch * 0.62) / (H * s)));     // at most 3: plants, dye and foam keep their shape
   view.s = s; view.ve = +ve.toFixed(ve < 10 ? 1 : 0);
-  view.x0 = -0.02 * L; view.z0 = -(ch / (s * view.ve) - H) / 2;
+  view.x0 = -54 / s; view.z0 = -(ch / (s * view.ve) - H) / 2;
   viewFitted = true;
 }
 function w2s(x, z) { return [(x - view.x0) * view.s, view.ch - (z - view.z0) * view.s * view.ve]; }
@@ -366,8 +366,10 @@ function buildMatImage() {
     isSolid[c] = (m === MAT.SOLID || m === MAT.SEDIMENT) ? 1 : 0;
     opq[c] = R.frac ? R.frac[c] : isSolid[c];
     let r = 0, g = 0, b = 0, a = 0;
-    if (m === MAT.SOLID) { const n = (hash2(i, k) - 0.5) * 10; r = 74 + n; g = 80 + n; b = 89 + n; a = 255; }
-    else if (m === MAT.SEDIMENT) {
+    // solids and sediment are cut by the section: empty inside, a pink cut line along the edge
+    // (cutLines) and dim white lines where the grain class changes inside the sediment
+    if (m === MAT.SOLID || m === MAT.SEDIMENT) { a = 0; }      // the black stage shows through (water is not drawn there)
+    else if (false) {
       // the mix of grain classes (from the moving bed) or the painted class; deposits laid down
       // while running are banded by time, so the bed reads like a cut core
       let w0 = 0, w1 = 0, w2 = 0;
@@ -413,6 +415,83 @@ function buildMatImage() {
     }
   }
   matCtx.putImageData(img, 0, 0);
+  buildCutLines(opq, isSolid);
+}
+// Section cut lines, as segments in metres (marching squares on the cell-centre fields, so they
+// follow the smooth outlines): the edge of everything solid or sediment (coverage 0.5), and inside
+// the sediment the boundaries between grain classes (fine sand fraction 0.5, gravel fraction 0.5).
+let cutSegs = new Float32Array(0), layerSegs = new Float32Array(0);
+function contour(nx, nz, val, level, keep) {
+  const { dx } = GRID, out = [];
+  const at = (i, k) => val(Math.max(0, Math.min(nx - 1, i)), Math.max(0, Math.min(nz - 1, k)));
+  const lerp = (a, b) => (level - a) / ((b - a) || 1e-9);
+  for (let k = -1; k < nz; k++) for (let i = -1; i < nx; i++) {
+    if (keep && !keep(i, k)) continue;
+    const v0 = at(i, k), v1 = at(i + 1, k), v2 = at(i + 1, k + 1), v3 = at(i, k + 1);   // corners: BL, BR, TR, TL
+    const idx = (v0 >= level ? 1 : 0) | (v1 >= level ? 2 : 0) | (v2 >= level ? 4 : 0) | (v3 >= level ? 8 : 0);
+    if (idx === 0 || idx === 15) continue;
+    const x0 = (i + 0.5) * dx, z0 = (k + 0.5) * dx;
+    const B = [x0 + lerp(v0, v1) * dx, z0], R = [x0 + dx, z0 + lerp(v1, v2) * dx], T = [x0 + lerp(v3, v2) * dx, z0 + dx], Lf = [x0, z0 + lerp(v0, v3) * dx];
+    const segs = { 1: [Lf, B], 2: [B, R], 3: [Lf, R], 4: [R, T], 5: [Lf, T, B, R], 6: [B, T], 7: [Lf, T], 8: [T, Lf], 9: [T, B], 10: [B, Lf, T, R], 11: [T, R], 12: [R, Lf], 13: [R, B], 14: [B, Lf] }[idx];
+    for (const q of segs) out.push(q[0], q[1]);
+  }
+  return new Float32Array(out);
+}
+function buildCutLines(opq, isSolid) {
+  const { nx, nz } = GRID, R = RASTER;
+  cutSegs = contour(nx, nz, (i, k) => opq[i + nx * k], 0.5);
+  // grain-class fractions per cell (moving bed mix, or the painted class); only inside the sediment
+  const wF = new Float32Array(nx * nz), wG = new Float32Array(nx * nz), sed = new Uint8Array(nx * nz);
+  for (let c = 0; c < nx * nz; c++) {
+    if (R.mat[c] !== MAT.SEDIMENT) continue; sed[c] = 1;
+    let w0 = 0, w1 = 0, w2 = 0;
+    if (R.comp) { w0 = R.comp[3 * c]; w1 = R.comp[3 * c + 1]; w2 = R.comp[3 * c + 2]; }
+    const tw = w0 + w1 + w2; if (tw > 1e-6) { w0 /= tw; w2 /= tw; } else { const cl = R.cls[c] | 0; w0 = cl === 0 ? 1 : 0; w2 = cl === 2 ? 1 : 0; }
+    wF[c] = w0; wG[c] = w2;
+  }
+  // smooth the fractions over the neighbouring sediment cells, so painted layers trace as
+  // smooth lines rather than cell steps
+  const blur = (w) => { const o = new Float32Array(nx * nz);
+    for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { const c = i + nx * k; if (!sed[c]) continue; let s = 0, n = 0;
+      for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) { const ii = i + di, kk = k + dk; if (ii < 0 || kk < 0 || ii >= nx || kk >= nz) continue; const q = ii + nx * kk; if (sed[q]) { const wt = (di || dk) ? 1 : 2; s += w[q] * wt; n += wt; } }
+      o[c] = s / n; }
+    return o; };
+  const sF = blur(wF), sG = blur(wG);
+  const inSed = (i, k) => { if (i < 0 || k < 0 || i + 1 >= nx || k + 1 >= nz) return false; const c = i + nx * k; return sed[c] && sed[c + 1] && sed[c + nx] && sed[c + nx + 1]; };
+  const a = contour(nx, nz, (i, k) => sF[i + nx * k], 0.5, inSed), b = contour(nx, nz, (i, k) => sG[i + nx * k], 0.5, inSed);
+  layerSegs = new Float32Array(a.length + b.length); layerSegs.set(a); layerSegs.set(b, a.length);
+}
+const CUT_COLOR = '#ff2e93';
+function strokeSegs(c, segs) {
+  c.beginPath();
+  for (let j = 0; j + 3 < segs.length; j += 4) { const [Xa, Ya] = w2s(segs[j], segs[j + 1]), [Xb, Yb] = w2s(segs[j + 2], segs[j + 3]); c.moveTo(Xa, Ya); c.lineTo(Xb, Yb); }
+  c.stroke();
+}
+// elevation (z) marks up the left of the flume and distance (x) marks along its floor; they stay
+// on screen when the view is panned or zoomed
+function drawDims(c) {
+  const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0);
+  const sx = niceStep(90 / view.s), sz = niceStep(40 / (view.s * view.ve));
+  const xr = Math.max(Math.min(X0, view.cw - 60), 52), yr = Math.min(Math.max(Y1, 40), view.ch - 22);
+  c.font = '10.5px system-ui, sans-serif'; c.lineWidth = 1;
+  c.strokeStyle = 'rgba(215,222,230,0.55)'; c.fillStyle = 'rgba(215,222,230,0.75)';
+  // z: ticks pointing left of the flume edge, labels to their left
+  c.textAlign = 'right'; c.textBaseline = 'middle'; c.beginPath();
+  const zLo = Math.max(0, s2w(0, view.ch)[1]), zHi = Math.min(DOMAIN.H, s2w(0, 0)[1]);
+  for (let z = Math.ceil(zLo / sz - 1e-9) * sz; z <= zHi + 1e-9; z += sz) {
+    const Y = Math.round(w2s(0, z)[1]) + 0.5; if (Y < 8 || Y > view.ch - 8) continue;
+    c.moveTo(xr - 6, Y); c.lineTo(xr, Y); c.fillText(fmtLen(z), xr - 9, Y);
+  }
+  c.moveTo(Math.round(xr) - 0.5, Math.max(Y0, 0)); c.lineTo(Math.round(xr) - 0.5, Math.min(Y1, view.ch)); c.stroke();
+  // x: ticks below the floor, labels under them
+  c.textAlign = 'center'; c.textBaseline = 'top'; c.beginPath();
+  const xLo = Math.max(0, s2w(0, 0)[0]), xHi = Math.min(DOMAIN.L, s2w(view.cw, 0)[0]);
+  for (let x = Math.ceil(xLo / sx - 1e-9) * sx; x <= xHi + 1e-9; x += sx) {
+    const X = Math.round(w2s(x, 0)[0]) + 0.5; if (X < xr + 4 || X > view.cw - 8) continue;
+    c.moveTo(X, yr); c.lineTo(X, yr + 6); c.fillText(fmtLen(x), X, yr + 8);
+  }
+  c.moveTo(Math.max(X0, xr), Math.round(yr) + 0.5); c.lineTo(Math.min(X1, view.cw), Math.round(yr) + 0.5); c.stroke();
+  c.textBaseline = 'alphabetic';
 }
 function matAt(x, z) {
   const i = Math.floor(x / GRID.dx), k = Math.floor(z / GRID.dx);
@@ -562,6 +641,11 @@ function drawUI(now) {
   // materials
   c.imageSmoothingEnabled = view.s * GRID.dx < 2.5 / matUX;
   if (matCanvas) c.drawImage(matCanvas, X0, Y0, X1 - X0, Y1 - Y0);
+  // the section cut: dim white lines between grain classes, then the pink cut line on top
+  c.lineJoin = 'round'; c.lineCap = 'round';
+  if (layerSegs.length) { c.strokeStyle = 'rgba(255,255,255,0.32)'; c.lineWidth = 1; strokeSegs(c, layerSegs); }
+  if (cutSegs.length) { c.strokeStyle = CUT_COLOR; c.lineWidth = 1.75; strokeSegs(c, cutSegs); }
+  drawDims(c);
   // plant stems
   if (stems.length) {
     // flexible plants bend: the model gives each column its effective length l_e/l and the flow's
