@@ -756,6 +756,13 @@ fn shearAt(x:f32, z:f32) -> f32 { let d = prm.dx; return abs(sU(x, z + d) - sU(x
       var above = 0.0; if (u32(top) + 1u < prm.nz) { above = f[i + N*(u32(top) + 1u)]; }
       eta[i] = (f32(top) + f[i + N*u32(top)] + above)*prm.dx;`),
     tick: K([['tb', 'f']], `if (c == 0u) { tb[0] += prm.dt; }`),
+    // per column, for the measured section: discharge q (m2/s), water depth h (water volume per unit
+    // width, so air pockets and overhangs count right) and the surface eta
+    colQ: K([['u', 'f'], ['f', 'f'], ['solid', 'u'], ['eta', 'f'], ['egl', 'f']], `if (c >= prm.nx) {return;} let i = c; let N = prm.nx; let W = prm.nx + 1u;
+      var q = 0.0; var h = 0.0;
+      for (var k = 0u; k < prm.nz; k++) { let cl = i + N*k; if (solid[cl] != 0u) { continue; } let fw = clamp(f[cl], 0.0, 1.0);
+        q += 0.5*(u[i + W*k] + u[i + 1u + W*k])*fw*prm.dx; h += fw*prm.dx; }
+      egl[3u*i] = q; egl[3u*i + 1u] = h; egl[3u*i + 2u] = eta[i];`),
     // Smagorinsky eddy viscosity per wet cell, capped for explicit stability
     nut: K([['u', 'f'], ['w', 'f'], ['typ', 'u'], ['nt', 'f']], `if (c >= prm.nx*prm.nz) {return;} let i = c % prm.nx; let k = c / prm.nx; let W = prm.nx+1u; let N = prm.nx;
       if (typ[c] != 1u) { nt[c] = 0.0; return; }
@@ -1115,7 +1122,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
       bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), cs: buf(3 * N), cs2: buf(3 * N),
-      part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx),
+      part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx), egl: buf(3 * nx),
     };
     const P0 = ubuf();
     const SPU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1180,6 +1187,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       fluxX: D('fluxX', P0, [B.f, B.u, B.flx, B.eta], NU), fluxZ: D('fluxZ', P0, [B.f, B.w, B.flx], NW),
       updX: D('updX', P0, [B.f, B.f0, B.u, B.flx, B.solid], N), updZ: D('updZ', P0, [B.f, B.f0, B.w, B.flx, B.solid], N),
       surface: D('surface', P0, [B.f, B.solid, B.eta], nx), tick: D('tick', P0, [B.tb], 1),
+      colQ: D('colQ', P0, [B.u, B.f, B.solid, B.eta, B.egl], nx),
       speed: D('speed', P0, [B.u, B.w, B.typ, B.tmp], N),
       nut: D('nut', P0, [B.u, B.w, B.typ, B.nt], N),
       diffU: D('diffU', P0, [B.u, B.typ, B.nt, B.u2], NU), diffW: D('diffW', P0, [B.w, B.typ, B.nt, B.w2], NW),
@@ -1300,7 +1308,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
     // readbacks already in flight carry the old run: bumping the generation makes them drop their
     // result when they land, so a restart is not painted over by the bed or surface it replaced
     M.gen++;
-    M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0];
+    M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0]; M.colHost = null;
     if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz); }
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
@@ -1413,6 +1421,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       M.device.queue.onSubmittedWorkDone().then(() => { M.msStep = (performance.now() - t0) / n; M.busy = false; }, () => { M.busy = false; });
     }
     if (M.frameNo % 6 === 0 && !M.readBusy) readScalars();
+    if (M.wantSection && M.frameNo % 10 === 3 && !M.colBusy) readColumns();
     // particles once a frame, by the model time this frame advanced (0 when paused)
     M.stepParticles(running && M.lastAdvance ? M.lastAdvance : 0);
     M.lastAdvance = 0;
@@ -1485,6 +1494,89 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
       st.unmap(); st.destroy(); M.etaBusy = false;
     }, () => { M.etaBusy = false; });
   }
+  // the measured section's columns: q, h, eta, smoothed in model time (tau a few seconds, so the
+  // energy line shows the steady state, not every eddy)
+  function readColumns() {
+    if (!M.S) return;
+    M.colBusy = true; const gen = M.gen, t = M.t, n = M.grid.nx, B = M.S.B;
+    const st = M.device.createBuffer({ size: B.egl.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.colQ); ps.end();
+    e.copyBufferToBuffer(B.egl, 0, st, 0, B.egl.size); M.device.queue.submit([e.finish()]);
+    st.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new Float32Array(st.getMappedRange().slice(0, 3 * n * 4)); st.unmap(); st.destroy(); M.colBusy = false;
+      if (gen !== M.gen) return;
+      const H = M.colHost;
+      const wetNow = (i) => a[3 * i + 1] > 2 * M.grid.dx && a[3 * i + 2] > 0;
+      if (!H || H.n !== n) { M.colHost = { n, t, q: new Float32Array(n), h: new Float32Array(n), eta: new Float32Array(n), wet: new Float32Array(n), w: 0 }; for (let i = 0; i < n; i++) { M.colHost.q[i] = a[3 * i]; M.colHost.h[i] = a[3 * i + 1]; M.colHost.eta[i] = a[3 * i + 2]; M.colHost.wet[i] = wetNow(i) ? 1 : 0; } return; }
+      const tau = M.p.type === 'wave' ? 3 * Math.max(M.p.T || 2, 0.5) : 3.0, al = 1 - Math.exp(-Math.max(t - H.t, 0) / tau);
+      if (al <= 0) return;
+      for (let i = 0; i < n; i++) {
+        const wt = wetNow(i); H.wet[i] += al * ((wt ? 1 : 0) - H.wet[i]);
+        if (!wt) continue;                       // a dry moment says nothing about the mean surface
+        if (H.eta[i] <= 0) { H.q[i] = a[3 * i]; H.h[i] = a[3 * i + 1]; H.eta[i] = a[3 * i + 2]; continue; }
+        H.q[i] += al * (a[3 * i] - H.q[i]); H.h[i] += al * (a[3 * i + 1] - H.h[i]); H.eta[i] += al * (a[3 * i + 2] - H.eta[i]);
+      }
+      H.t = t; H.w = Math.min(1, H.w + al);
+    }, () => { M.colBusy = false; });
+  }
+  // Lines for the measured section, in metres: named levels (horizontal), lines along the flume,
+  // and marks (energy losses). River: tailwater, the energy line E = eta + U^2/2g, and the critical
+  // depth over the bed; wave: still water, nominal crest and trough, and the mean water level.
+  M.sectionLines = function () {
+    if (!M.ok || !M.grid) return null;
+    const g = M.grid, p = M.p, river = p.type !== 'wave', out = { levels: [], lines: [], marks: [] };
+    if (river) out.levels.push({ z: bedAt(g.nx - 1) + Math.max(p.hout, g.dx), label: 'tailwater', style: 'tail' });
+    else {
+      out.levels.push({ z: p.h0, label: 'still water', style: 'still' });
+      if (p.H > 0) { out.levels.push({ z: p.h0 + p.H / 2, label: 'wave crest', style: 'faint' }); out.levels.push({ z: p.h0 - p.H / 2, label: 'wave trough', style: 'faint' }); }
+    }
+    const H = M.colHost; if (!H || H.w < 0.3) return out;
+    const n = g.nx, dx = g.dx, ok = (i) => H.wet[i] > 0.9 && H.h[i] > 2 * dx && H.eta[i] > 0;
+    // smooth over a few cells
+    const sm = (a, r) => { const o = new Float32Array(n); for (let i = 0; i < n; i++) { let s = 0, c = 0; for (let j = Math.max(0, i - r); j <= Math.min(n - 1, i + r); j++) if (ok(j)) { s += a[j]; c++; } o[i] = c ? s / c : NaN; } return o; };
+    const r = Math.max(2, Math.round(0.02 * n / 20));
+    const eta = sm(H.eta, r), h = sm(H.h, r), q = sm(H.q, r);
+    const poly = (f) => { const pts = []; let seg = []; for (let i = 0; i < n; i++) { const z = ok(i) ? f(i) : NaN; if (isFinite(z)) seg.push([(i + 0.5) * dx, z]); else if (seg.length) { if (seg.length > 2) pts.push(seg); seg = []; } } if (seg.length > 2) pts.push(seg); return pts; };
+    if (river) {
+      const E = new Float32Array(n); for (let i = 0; i < n; i++) { const U = q[i] / Math.max(h[i], dx); E[i] = eta[i] + U * U / (2 * G); }
+      out.lines.push({ segs: poly((i) => E[i]), label: 'energy', style: 'energy' });
+      const yc = Math.cbrt(Math.max(p.q, 0) ** 2 / G);
+      if (yc > dx) out.lines.push({ segs: poly((i) => eta[i] - h[i] + yc), label: 'critical depth', style: 'critical' });
+      // energy losses: across each stretch of rapidly varied flow (where the time-mean surface slopes
+      // more than 2%: a jump, a drawdown over a crest, a plunge behind a block), the energy line's
+      // drop from just before to just after it; smooth stretches (friction only) are not marked
+      let hm = 0, cnt = 0; for (let i = 0; i < n; i++) if (ok(i)) { hm += h[i]; cnt++; } hm = cnt ? hm / cnt : 0;
+      const steep = new Uint8Array(n);
+      // slope over about half a depth (small ripples do not count); the inlet and outlet zones,
+      // where the boundaries shape the surface, are left out
+      let hx = 0; for (let i = 0; i < n; i++) if (ok(i)) hx = Math.max(hx, h[i]);
+      const sw = Math.max(2, Math.round(0.5 * hm / dx)), e0 = Math.max(sw, Math.round(3 * hx / dx));
+      for (let i = e0; i < n - e0; i++) if (ok(i - sw) && ok(i + sw) && Math.abs(eta[i + sw] - eta[i - sw]) / (2 * sw * dx) > 0.02) steep[i] = 1;
+      const regs = []; let i0 = -1;
+      for (let i = 0; i <= n; i++) { if (i < n && steep[i]) { if (i0 < 0) i0 = i; } else if (i0 >= 0) { regs.push([i0, i - 1]); i0 = -1; } }
+      const gap = Math.max(2, Math.round(2 * hx / dx)), merged = [];     // the deep water's depth sets the scale (a long shallow jet must not)
+      for (const r of regs) { const last = merged[merged.length - 1]; if (last && r[0] - last[1] <= gap) last[1] = r[1]; else merged.push(r.slice()); }
+      const mg = Math.max(2, Math.round(0.5 * hm / dx)), thr = Math.max(0.04 * hm, 1e-3);
+      const found = [];
+      for (const [r0, r1] of merged) {
+        let ia = Math.max(0, r0 - mg), ib = Math.min(n - 1, r1 + mg);
+        while (ia < r0 && !isFinite(E[ia])) ia++; while (ib > r1 && !isFinite(E[ib])) ib--;
+        if (!isFinite(E[ia]) || !isFinite(E[ib])) continue;
+        const d = E[ia] - E[ib]; if (d <= thr) continue;
+        // draw it where 90% of the loss happens (the ends of a long stretch are often friction only)
+        let ja = ia, jb = ib;
+        while (ja < ib && !(isFinite(E[ja]) && E[ia] - E[ja] >= 0.05 * d)) ja++;
+        while (jb > ja && !(isFinite(E[jb]) && E[jb] - E[ib] >= 0.05 * d)) jb--;
+        found.push({ ia: Math.max(ia, ja - 1), ib: Math.min(ib, jb + 1), d, Ea: E[ia], Eb: E[ib] });
+      }
+      found.sort((p1, p2) => p2.d - p1.d);
+      for (const f of found.slice(0, 4)) out.marks.push({ x0: (f.ia + 0.5) * dx, x1: (f.ib + 0.5) * dx, z0: f.Ea, z1: f.Eb, label: 'ΔE ' + fmtM(f.d) });
+    } else {
+      out.lines.push({ segs: poly((i) => eta[i]), label: 'mean water level', style: 'mean' });
+    }
+    return out;
+  };
+  function fmtM(m) { return m >= 1 ? m.toFixed(2) + ' m' : m >= 0.01 ? (m * 100).toFixed(1) + ' cm' : (m * 1000).toFixed(1) + ' mm'; }
   function readScalars() {
     M.readBusy = true; const gen = M.gen;
     const st = M.device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
@@ -1583,6 +1675,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1)
     },
     write(name, data) { M.device.queue.writeBuffer(M.S.B[name], 0, data); },
     readBed() { readBed(); },                // start the page's bed readback (for the restart check)
+    async readColumns() { readColumns(); while (M.colBusy) await new Promise(r => setTimeout(r, 2)); },
     async read(name) {
       const B = M.S.B[name], n = B.size / 4;
       const st = M.device.createBuffer({ size: B.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });

@@ -36,6 +36,9 @@
   .btns button, button.wide { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; font: inherit; cursor: pointer; }
   .btns button:hover, button.wide:hover { border-color: var(--dim); }
   button.primary { background: var(--accent); color: #1b1408; border-color: var(--accent); font-weight: 600; }
+  .toggles { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 8px; }
+  .toggles button { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; font: 11px/1.3 inherit; font-family: inherit; text-transform: lowercase; letter-spacing: .03em; cursor: pointer; }
+  .toggles button.on { color: var(--text); border-color: var(--dim); background: var(--panel2); }
   #model-controls, #mat-props { display: contents; }
   #stats { font-variant-numeric: tabular-nums; }
   #stats .row { margin: 2px 0; }
@@ -86,6 +89,11 @@
       <button id="clear-dye" title="Clear the dye">clear dye</button>
       <select id="speed" title="model seconds per real second"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>real time</option><option value="2">2× speed</option><option value="4">4× speed</option></select>
     </div>
+    <div class="toggles" id="view-toggles">
+      <button data-view="levels" class="on" title="Named water levels and the crests of what you drew">levels</button>
+      <button data-view="energy" class="on" title="River: the energy line, critical depth and where energy is lost. Waves: the mean water level">energy</button>
+      <button data-view="grid" title="Elevation and distance marks with a faint metric grid">grid</button>
+    </div>
 
     <h2>Water</h2>
     <div id="model-controls"></div>
@@ -95,7 +103,6 @@
     <div class="row"><label for="len">length (m)</label><input id="len" type="number" step="any" min="0.5"></div>
     <div class="row"><label for="hgt">height (m)</label><input id="hgt" type="number" step="any" min="0.05"></div>
     <div class="row"><label for="bedstyle">bed drawing</label><select id="bedstyle"><option value="both">patterns and lines</option><option value="patterns">patterns</option><option value="lines">lines</option></select></div>
-    <div class="row"><label for="grid">lab grid</label><select id="grid"><option value="0">off</option><option value="1">on</option></select></div>
     <div class="row"><label for="res">resolution</label><select id="res"><option value="draft">draft</option><option value="normal">normal</option><option value="fine">fine</option></select></div>
 
     <h2>Material</h2>
@@ -512,6 +519,70 @@ function drawGrainPatterns(c) {
   }
 }
 const CUT_COLOR = '#ff2e93';
+// The measured section (after the Torcello section and the hydraulic engineer's long section):
+// named levels as hairlines labelled in their own colour, the energy line and critical depth, the
+// energy lost at a jump or behind an obstacle, and the crests of what was drawn. Lines come from
+// the model (model.sectionLines); crests from the shapes.
+const SEC_STYLE = {
+  still: { c: 'rgba(0,229,255,0.85)', dash: [5, 3], w: 1 }, faint: { c: 'rgba(0,229,255,0.45)', dash: [1.5, 3], w: 1 },
+  tail: { c: 'rgba(255,179,71,0.9)', dash: [5, 3], w: 1 }, mean: { c: 'rgba(160,235,255,0.9)', dash: [], w: 1 },
+  energy: { c: 'rgba(255,255,255,0.85)', dash: [], w: 1 }, critical: { c: 'rgba(62,207,142,0.85)', dash: [1.5, 2.5], w: 1 },
+  crest: { c: 'rgba(255,255,255,0.55)', dash: [], w: 1 },
+};
+function drawSection(c) {
+  const sec = (VIEW.levels || VIEW.energy) && model && model.sectionLines ? model.sectionLines() : null;
+  if (model) model.wantSection = VIEW.energy;
+  const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0), labels = [];
+  const xa = Math.max(X0, 4), xb = Math.min(X1, view.cw - 4);
+  c.save(); c.beginPath(); c.rect(X0, Y0, X1 - X0, Y1 - Y0); c.clip();
+  const set = (st) => { const S = SEC_STYLE[st] || SEC_STYLE.crest; c.strokeStyle = S.c; c.setLineDash(S.dash); c.lineWidth = S.w; return S; };
+  if (VIEW.levels) {
+    for (const lv of (sec ? sec.levels : [])) {
+      const Y = Math.round(w2s(0, lv.z)[1]) + 0.5; if (Y < 0 || Y > view.ch) continue;
+      const S = set(lv.style); c.beginPath(); c.moveTo(xa, Y); c.lineTo(xb, Y); c.stroke();
+      labels.push({ x: xb - 4, y: Y - 3, t: lv.label + ' ' + fmtLen(lv.z), c: S.c, align: 'right' });
+    }
+    // crests of solids and porous shapes: a short hairline over the top, labelled
+    for (const sh of scene.shapes) {
+      if (sh.mat !== MAT.SOLID && sh.mat !== MAT.POROUS) continue;
+      const b = bboxOf(sh); const [Xa, Y] = w2s(b.x0, b.z1), [Xb] = w2s(b.x1, b.z1), ext = 14;
+      const S = set('crest'); c.beginPath(); c.moveTo(Xa - ext, Math.round(Y) - 0.5); c.lineTo(Xb + ext, Math.round(Y) - 0.5); c.stroke();
+      labels.push({ x: (Xa + Xb) / 2, y: Y - 5, t: 'crest ' + fmtLen(b.z1), c: S.c, align: 'center' });
+    }
+  }
+  if (VIEW.energy && sec) {
+    for (const ln of sec.lines) {
+      const S = set(ln.style); let last = null;
+      for (const seg of ln.segs) { c.beginPath(); seg.forEach(([x, z], j) => { const [X, Y] = w2s(x, z); j ? c.lineTo(X, Y) : c.moveTo(X, Y); }); c.stroke(); last = seg; }
+      // label at the visible end of the longest segment
+      const seg = ln.segs.slice().sort((a, b) => b.length - a.length)[0];
+      if (seg) { let pick = null; for (let j = seg.length - 1; j >= 0; j--) { const [X, Y] = w2s(seg[j][0], seg[j][1]); if (X > xa + 60 && X < xb - 40) { pick = [X, Y]; break; } } if (pick) labels.push({ x: pick[0] - 6, y: pick[1] - 4, t: ln.label, c: S.c, align: 'right' }); }
+    }
+    // energy losses: a bracket from the line upstream to the line downstream, with the drop
+    c.setLineDash([]);
+    for (const m of sec.marks) {
+      const [Xa, Ya] = w2s(m.x0, m.z0), [Xb, Yb] = w2s(m.x1, m.z1), Xm = (Xa + Xb) / 2;
+      c.strokeStyle = 'rgba(255,255,255,0.7)'; c.lineWidth = 1; c.beginPath();
+      // a dimension line at the downstream end, from the energy before to the energy after, with a
+      // dotted extension back to where the stretch begins
+      c.moveTo(Xb - 4, Ya + 0.5); c.lineTo(Xb + 4, Ya + 0.5); c.moveTo(Xb + 0.5, Ya); c.lineTo(Xb + 0.5, Yb); c.moveTo(Xb - 4, Yb + 0.5); c.lineTo(Xb + 4, Yb + 0.5); c.stroke();
+      c.setLineDash([1.5, 2.5]); c.beginPath(); c.moveTo(Xa, Ya + 0.5); c.lineTo(Xb, Ya + 0.5); c.stroke(); c.setLineDash([]);
+      labels.push({ x: Xb + 7, y: (Ya + Yb) / 2 + 3, t: m.label, c: 'rgba(255,255,255,0.9)', align: 'left' });
+    }
+  }
+  c.restore(); c.setLineDash([]);
+  // labels: small type in each line's colour, nudged apart so none overlap
+  c.font = '10.5px system-ui, sans-serif'; c.textBaseline = 'alphabetic';
+  labels.sort((a, b) => a.y - b.y);
+  const placed = [];
+  for (const L of labels) {
+    const w = c.measureText(L.t).width, x0 = L.align === 'right' ? L.x - w : L.align === 'center' ? L.x - w / 2 : L.x;
+    let y = L.y; for (let it = 0; it < 6; it++) { const hit = placed.find(p => x0 < p.x1 + 6 && x0 + w > p.x0 - 6 && Math.abs(p.y - y) < 11); if (!hit) break; y = hit.y + 11; }
+    placed.push({ x0, x1: x0 + w, y });
+    c.fillStyle = 'rgba(0,0,0,0.55)'; c.fillRect(x0 - 2, y - 9, w + 4, 12);
+    c.fillStyle = L.c; c.textAlign = 'left'; c.fillText(L.t, x0, y);
+  }
+}
 function strokeSegs(c, segs) {
   c.beginPath();
   for (let j = 0; j + 3 < segs.length; j += 4) { const [Xa, Ya] = w2s(segs[j], segs[j + 1]), [Xb, Yb] = w2s(segs[j + 2], segs[j + 3]); c.moveTo(Xa, Ya); c.lineTo(Xb, Yb); }
@@ -672,6 +743,7 @@ function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m 
 function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
 
 let showGrid = false;
+const VIEW = { levels: true, energy: true, grid: false };
 function drawBackground() {
   const c = bgCtx, r = view.dpr; c.setTransform(r, 0, 0, r, 0, 0);
   // pure black, so the water and particles carry the picture; a faint metric grid on request
@@ -696,7 +768,8 @@ function drawUI(now) {
   drawGrainPatterns(c);
   if (layerSegs.length && bedStyle !== 'patterns') { c.strokeStyle = 'rgba(255,255,255,0.32)'; c.lineWidth = 1; strokeSegs(c, layerSegs); }
   if (cutSegs.length) { c.strokeStyle = CUT_COLOR; c.lineWidth = 1.75; strokeSegs(c, cutSegs); }
-  drawDims(c);
+  if (VIEW.grid) drawDims(c);
+  drawSection(c);
   // plant stems
   if (stems.length) {
     // flexible plants bend: the model gives each column its effective length l_e/l and the flow's
@@ -1168,7 +1241,8 @@ function wire() {
   $('scale').addEventListener('change', (e) => setScale(e.target.value));
   $('len').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ L: v }); else syncDomainInputs(); });
   $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
-  $('grid').addEventListener('change', (e) => { showGrid = e.target.value === '1'; });
+  // view toggles (like the sediment interface's): each button switches one layer of the drawing
+  for (const b of document.querySelectorAll('#view-toggles button')) b.addEventListener('click', () => { const k = b.dataset.view; VIEW[k] = !VIEW[k]; b.classList.toggle('on', VIEW[k]); if (k === 'grid') showGrid = VIEW.grid; });
   $('bedstyle').addEventListener('change', (e) => { bedStyle = e.target.value; });
   $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
   $('run').addEventListener('click', () => setRunning(!running));

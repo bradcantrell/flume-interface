@@ -167,6 +167,18 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('hydraulic jump forms and stays in the flume', toe !== undefined && toe > 0.3 && toe < 6.5, 'toe at ' + (toe ? toe.toFixed(2) : 'none') + ' m');
     check('hydraulic jump: depth after the jump within 12% of the conjugate of the depth before it', toe !== undefined && Math.abs(after - h2B) / h2B < 0.12,
       'before ' + (before * 1000).toFixed(0) + ' mm (Fr ' + FrB.toFixed(2) + '), after ' + (after * 1000).toFixed(0) + ' mm, Belanger ' + (h2B * 1000).toFixed(0) + ' mm');
+    // the measured section: the energy lost across the jump, as marked on the energy line, against
+    // the classical loss for the measured depths, (y2 - y1)^3 / (4 y1 y2)
+    const sdt = dt; for (let tt = 0; tt < 10; tt += 0.25) { await M.debug.steps(Math.round(0.25 / sdt), sdt); await M.debug.readColumns(); }
+    const sec = M.sectionLines(), mk = sec && sec.marks.length ? sec.marks.slice().sort((a, b) => (b.z0 - b.z1) - (a.z0 - a.z1))[0] : null;
+    // two textbook estimates of the loss for the measured time-mean depths before (y1) and after
+    // (y2): the energy balance E = z + y + q^2/(2 g y^2), and the classical (y2 - y1)^3 / (4 y1 y2),
+    // which assumes y2 is exactly conjugate; a real flume sits between them
+    const Eb = zb + before + q * q / (2 * g * before * before), Ea = zb + after + q * q / (2 * g * after * after);
+    const dBal = Eb - Ea, dCls = toe ? Math.pow(after - before, 3) / (4 * before * after) : 0, dE = mk ? mk.z0 - mk.z1 : 0;
+    const lo = 0.9 * Math.min(dBal, dCls), hi = 1.1 * Math.max(dBal, dCls);
+    check('measured section: the energy loss marked at the jump lies between the two textbook estimates (within 10%), at the jump', mk && dE > lo && dE < hi && toe > mk.x0 - 0.3 && toe < mk.x1 && mk.x1 - mk.x0 < 2.0,
+      (process.env.FLUME_DEBUG ? JSON.stringify(sec.marks.map(m => [m.x0.toFixed(2), m.x1.toFixed(2), ((m.z0 - m.z1) * 1000).toFixed(1)])) + ' ' : '') + 'marked ' + (dE * 1000).toFixed(1) + ' mm over ' + (mk ? mk.x0.toFixed(2) + '-' + mk.x1.toFixed(2) + ' m' : '-') + ', energy balance ' + (dBal * 1000).toFixed(1) + ' mm, classical ' + (dCls * 1000).toFixed(1) + ' mm, toe ' + (toe ? toe.toFixed(2) : '-') + ' m');
   }
 
   // 7. porous block across the whole flume: head drop = integral of (A u + B u^2)/g, superficial u

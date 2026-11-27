@@ -19,16 +19,16 @@ function png(file, W, H, rgba) {
 const SCENES = {
   // a sluice gate and a hydraulic jump, then a sill downstream
   jump: { L: 8, H: 0.6, dx: 0.01, p: { type: 'river', h0: 0.07, q: 0.10, hout: 0.19, sediment: false },
-    paint: (x, z) => (z < 0.02 ? 1 : (x < 0.15 && z > 0.06) ? 1 : (x > 5.6 && x < 5.9 && z < 0.10) ? 1 : 0), view: { x0: -0.12, z0: -0.025, L: 4.8, ve: 3, H: 440 } },
+    paint: (x, z) => (z < 0.02 ? 1 : (x < 0.15 && z > 0.06) ? 1 : (x > 5.6 && x < 5.9 && z < 0.10) ? 1 : 0), view: { x0: -0.12, z0: -0.025, L: 4.8, ve: 3, H: 440 }, crests: [[5.6, 5.9, 0.10]] },
   // waves over a submerged reef breaking on a sand beach
   waves: { L: 20, H: 1.0, dx: 0.0125, p: { type: 'wave', h0: 0.45, H: 0.12, T: 2.2, farEnd: 'beach', absorb: true, sediment: false },
-    paint: (x, z) => { const bed = x < 9 ? 0.06 : 0.06 + (x - 9) * 0.07; if (z < bed) return 4; if (x > 6.5 && x < 7.8 && z < 0.32 - Math.abs(x - 7.15) * 0.3) return 1; return 0; }, view: { x0: 5.2, z0: -0.04, L: 10.8, ve: 3, H: 400 } },
+    paint: (x, z) => { const bed = x < 9 ? 0.06 : 0.06 + (x - 9) * 0.07; if (z < bed) return 4; if (x > 6.5 && x < 7.8 && z < 0.32 - Math.abs(x - 7.15) * 0.3) return 1; return 0; }, view: { x0: 5.2, z0: -0.04, L: 10.8, ve: 3, H: 400 }, crests: [[6.5, 7.8, 0.32]] },
 };
 
 (async () => {
   const which = process.argv[2] || 'jump', out = process.argv[3], secs = +(process.argv[4] || 12), fps = +(process.argv[5] || 30);
   const S = SCENES[which]; fs.mkdirSync(out, { recursive: true });
-  if (process.env.VIEWJSON) fs.writeFileSync(process.env.VIEWJSON, JSON.stringify(S.view));
+  if (process.env.VIEWJSON) fs.writeFileSync(process.env.VIEWJSON, JSON.stringify(Object.assign({ crests: S.crests || [] }, S.view)));
   const { create, globals } = await import('webgpu'); Object.assign(globalThis, globals);
   let M = null; globalThis.registerModel = (m) => { M = m; };
   vm.runInThisContext(fs.readFileSync(path.join(__dirname, '..', 'model.js'), 'utf8'), { filename: 'model.js' });
@@ -66,8 +66,9 @@ const SCENES = {
     const n = Math.max(1, Math.round(perFrame / dt));
     await M.debug.steps(n, dt);
     M.stepParticles(n * dt);                     // the particles move by this frame's model time
-    if (t < 0) continue;
+    if (t < 0) { if (process.env.SECTION && frame % 1 === 0) await M.debug.readColumns(); continue; }
     if (process.env.FRAMES && !process.env.FRAMES.split(',').includes(String(frame))) { frame++; continue; }
+    if (process.env.SECTION) { M.wantSection = true; await M.debug.readColumns(); fs.writeFileSync(path.join(out, 's' + String(frame).padStart(5, '0') + '.json'), JSON.stringify(M.sectionLines())); }
     M.render(Object.assign({}, view, { target: tex, _rb: true }));
     const e = M.device.createCommandEncoder(); e.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: bpr }, [W, H]); M.device.queue.submit([e.finish()]);
     await rb.mapAsync(GPUMapMode.READ); const src = new Uint8Array(rb.getMappedRange());
