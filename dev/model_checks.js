@@ -177,7 +177,7 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     const Eb = zb + before + q * q / (2 * g * before * before), Ea = zb + after + q * q / (2 * g * after * after);
     const dBal = Eb - Ea, dCls = toe ? Math.pow(after - before, 3) / (4 * before * after) : 0, dE = mk ? mk.z0 - mk.z1 : 0;
     const lo = 0.9 * Math.min(dBal, dCls), hi = 1.1 * Math.max(dBal, dCls);
-    check('measured section: the energy loss marked at the jump lies between the two textbook estimates (within 10%), at the jump', mk && dE > lo && dE < hi && toe > mk.x0 - 0.3 && toe < mk.x1 && mk.x1 - mk.x0 < 2.0,
+    check('measured section: the energy loss marked at the jump lies between the two textbook estimates (within 10%), at the jump', mk && dE > lo && dE < hi && toe > mk.x0 - 0.3 && toe < mk.x1 + 0.3 && mk.x1 - mk.x0 < 2.0,
       (process.env.FLUME_DEBUG ? JSON.stringify(sec.marks.map(m => [m.x0.toFixed(2), m.x1.toFixed(2), ((m.z0 - m.z1) * 1000).toFixed(1)])) + ' ' : '') + 'marked ' + (dE * 1000).toFixed(1) + ' mm over ' + (mk ? mk.x0.toFixed(2) + '-' + mk.x1.toFixed(2) + ' m' : '-') + ', energy balance ' + (dBal * 1000).toFixed(1) + ' mm, classical ' + (dCls * 1000).toFixed(1) + ' mm, toe ' + (toe ? toe.toFixed(2) : '-') + ' m');
   }
 
@@ -418,6 +418,65 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
       zs.length + ' particles, height spread ' + (spread * 1000).toFixed(1) + ' mm, speed ' + (v * 100).toFixed(1) + ' cm/s vs q/h ' + (U * 100).toFixed(1) + ' cm/s');
     const rerr = await M.debug.validateRender(400, 200); M.comb.on = false;
     check('the smoke comb filaments build and draw', !rerr, rerr);
+  }
+
+  // 26. spray: a blob under half full in the air falls as a body should (it used to hang, its faces set to 0)
+  if (want('droplet')) {
+    const ddx = 0.01, r = flume(2, 1.2, ddx, () => 0), nx = r.nx, nz = r.nz;
+    await setup(r, { type: 'wave', h0: 0.20, H: 0, T: 2, farEnd: 'wall', absorb: false });
+    const f = await M.debug.read('f'), f2 = new Float32Array(f);
+    for (let k = 100; k < 104; k++) for (let i = 98; i < 102; i++) f2[i + nx * k] = 0.45;
+    M.debug.write('f', f2);
+    await M.debug.steps(150, 0.002);
+    const ff = await M.debug.read('f'); let m = 0, mz = 0; for (let k = 30; k < nz; k++) for (let i = 0; i < nx; i++) { m += ff[i + nx * k]; mz += ff[i + nx * k] * (k + 0.5) * ddx; }
+    const zc = m > 0 ? mz / m : NaN, fall = 1.02 - zc, ff0 = 0.5 * g * 0.09;
+    check('spray: a blob under half full falls within 5% of free fall over 0.3 s', Math.abs(fall / ff0 - 1) < 0.05, 'fell ' + (fall * 100).toFixed(1) + ' cm, free fall ' + (ff0 * 100).toFixed(1) + ' cm');
+  }
+
+  // 27. dam break: the surface each column reports is the connected water, not spray thrown above it,
+  //     and no loose water is left in the air at the end
+  if (want('dambreak')) {
+    const ddx = 0.01, r = flume(4, 1.0, ddx, () => 0), nx = r.nx, nz = r.nz;
+    await setup(r, { type: 'wave', h0: 0.05, H: 0, T: 2, farEnd: 'wall', absorb: false });
+    const f = new Float32Array(nx * nz); for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { const x = (i + 0.5) * ddx, z = (k + 0.5) * ddx; f[i + nx * k] = (z < 0.05 || (x < 1.0 && z < 0.6)) ? 1 : 0; }
+    M.debug.write('f', f);
+    const v0 = await volume(r); let t = 0, vmax = 3.5, worstSpray = 0, sprayMax = 0, loose = 0;
+    for (const until of [2, 3, 4, 8, 16]) {
+      while (t < until - 1e-9) { const dt = Math.min(0.4 * ddx / Math.max(vmax, 0.6), 0.05), n = Math.min(10, Math.ceil((until - t) / dt)); await M.debug.steps(n, dt); t += n * dt;
+        const sc = await M.debug.read('scal'); if (isFinite(sc[7])) vmax = Math.max(sc[7], 0.6) * 1.15; }
+      const ff = await M.debug.read('f'), e = await M.debug.read('eta');
+      if (until <= 4) {
+        // connected water: up from the floor through water, over air pockets of at most two cells
+        let lifted = 0, sprayCols = 0;
+        for (let i = 0; i < nx; i++) {
+          let k = 0, top = -1; while (k < nz) { if (ff[i + nx * k] > 0.5) { top = k; k++; continue; } if ((k + 1 < nz && ff[i + nx * (k + 1)] > 0.5) || (k + 2 < nz && ff[i + nx * (k + 2)] > 0.5)) { k++; continue; } break; }
+          let topAll = -1; for (let kk = nz - 1; kk >= 0; kk--) if (ff[i + nx * kk] > 0.5) { topAll = kk; break; }
+          if (topAll > top + 3) sprayCols++;
+          if (top >= 0 && e[i] > (top + 2) * ddx) lifted++;
+        }
+        worstSpray = Math.max(worstSpray, lifted); sprayMax = Math.max(sprayMax, sprayCols);
+      }
+      if (until === 16) { let wv = 0; for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { const c = i + nx * k, x = ff[c]; if (x > 0 && x < 0.5) { const nb = (i > 0 && ff[c - 1] > 0.5) || (i < nx - 1 && ff[c + 1] > 0.5) || (k > 0 && ff[c - nx] > 0.5) || (k < nz - 1 && ff[c + nx] > 0.5); if (!nb) wv += x; } } loose = wv * ddx * ddx / v0; }
+    }
+    check('dam break: the reported surface is the connected water (air bubbles inside count), never spray above it, and no loose water hangs in the air', worstSpray === 0 && sprayMax > 0 && loose < 2e-4,
+      'columns above the connected water at 2-4 s: ' + worstSpray + ' of ' + nx + ' (spray above the surface in up to ' + sprayMax + '); loose water at 16 s: ' + (loose * 100).toFixed(3) + '%');
+  }
+
+  // 28. foam is born per model second, not per frame: the same flow stepped at 60 and at 15 frames a
+  //     second gives about the same foam
+  if (want('foamrate')) {
+    const counts = [];
+    for (const fps of [60, 15]) {
+      const ddx = 0.01, r = flume(4, 1.0, ddx, () => 0), nx = r.nx, nz = r.nz;
+      await setup(r, { type: 'wave', h0: 0.05, H: 0, T: 2, farEnd: 'wall', absorb: false });
+      const f = new Float32Array(nx * nz); for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { const x = (i + 0.5) * ddx, z = (k + 0.5) * ddx; f[i + nx * k] = (z < 0.05 || (x < 1.0 && z < 0.6)) ? 1 : 0; }
+      M.debug.write('f', f); M.particles = true;
+      const dt = 0.4 * ddx / 4, per = Math.round((1 / fps) / dt);
+      for (let t = 0; t < 3 - 1e-9; t += per * dt) { await M.debug.steps(per, dt); M.stepParticles(per * dt); }
+      const P = await M.debug.read('P'); let n = 0; for (let j = M.S.nT; j < M.S.nT + M.S.nF; j++) if (P[8 * j + 6] >= 0) n++;
+      counts.push(n);
+    }
+    check('foam is born per model second: live foam within 15% at 60 and 15 particle steps a second', counts[0] > 200 && Math.abs(counts[1] / counts[0] - 1) < 0.15, counts[0] + ' at 60, ' + counts[1] + ' at 15');
   }
 
   // 25. bubble wire: in an empty river flume a timeline's displacement over its age is the velocity

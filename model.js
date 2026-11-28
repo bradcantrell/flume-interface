@@ -168,22 +168,24 @@ fn nbr(c:u32, i:u32, k:u32, x: ptr<function, f32>) -> f32 {
     validW: K([['typ', 'u'], ['wv', 'u']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
       var b = 0u; var t = 0u; if (k > 0u) { b = typ[i+N*(k-1u)]; } if (k < prm.nz) { t = typ[i+N*k]; }
       wv[c] = select(0u, 1u, b == 1u || t == 1u);`),
-    extrapU: K([['a', 'f'], ['av', 'u'], ['o', 'f'], ['ov', 'u']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
+    extrapU: K([['a', 'f'], ['av', 'u'], ['o', 'f'], ['ov', 'u'], ['f', 'f']], `let W = prm.nx+1u; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
+      var wetAdj = false; if (i > 0u && f[i-1u+prm.nx*k] > 1e-4) { wetAdj = true; } if (i < prm.nx && f[i+prm.nx*k] > 1e-4) { wetAdj = true; }
       if (av[c] == 1u) { o[c] = a[c]; ov[c] = 1u; return; }
       var s = 0.0; var n = 0.0;
       if (i > 0u && av[c-1u] == 1u) { s += a[c-1u]; n += 1.0; }
       if (i < prm.nx && av[c+1u] == 1u) { s += a[c+1u]; n += 1.0; }
       if (k > 0u && av[c-W] == 1u) { s += a[c-W]; n += 1.0; }
       if (k < prm.nz-1u && av[c+W] == 1u) { s += a[c+W]; n += 1.0; }
-      if (n > 0.0) { o[c] = s/n; ov[c] = 1u; } else { o[c] = 0.0; ov[c] = 0u; }`),
-    extrapW: K([['a', 'f'], ['av', 'u'], ['o', 'f'], ['ov', 'u']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      if (n > 0.0) { o[c] = s/n; ov[c] = 1u; } else { o[c] = select(0.0, a[c], wetAdj); ov[c] = 0u; }`),
+    extrapW: K([['a', 'f'], ['av', 'u'], ['o', 'f'], ['ov', 'u'], ['f', 'f']], `let N = prm.nx; if (c >= N*(prm.nz+1u)) {return;} let i = c % N; let k = c / N;
+      var wetAdj = false; if (k > 0u && f[i+N*(k-1u)] > 1e-4) { wetAdj = true; } if (k < prm.nz && f[i+N*k] > 1e-4) { wetAdj = true; }
       if (av[c] == 1u) { o[c] = a[c]; ov[c] = 1u; return; }
       var s = 0.0; var n = 0.0;
       if (i > 0u && av[c-1u] == 1u) { s += a[c-1u]; n += 1.0; }
       if (i < N-1u && av[c+1u] == 1u) { s += a[c+1u]; n += 1.0; }
       if (k > 0u && av[c-N] == 1u) { s += a[c-N]; n += 1.0; }
       if (k < prm.nz && av[c+N] == 1u) { s += a[c+N]; n += 1.0; }
-      if (n > 0.0) { o[c] = s/n; ov[c] = 1u; } else { o[c] = 0.0; ov[c] = 0u; }`),
+      if (n > 0.0) { o[c] = s/n; ov[c] = 1u; } else { o[c] = select(0.0, a[c], wetAdj); ov[c] = 0u; }`),
     advectU: K([['u', 'f'], ['w', 'f'], ['o', 'f']], `let W = prm.nx+1u; let N = prm.nx; if (c >= W*prm.nz) {return;} let i = c % W; let k = c / W;
       if (i == 0u || i == prm.nx) { o[c] = u[c]; return; }
       let x = f32(i)*prm.dx; let z = (f32(k)+0.5)*prm.dx; let dt = prm.dt;
@@ -585,7 +587,10 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
       } else {
         if (age < 0.0 || age > life || !inside || (inside && solid[cl] != 0u)) {
           age = -1.0; fresh = true;
-          // try to be born: a random column, at its surface or somewhere in the water below it
+          // try to be born: a random column, at its surface or somewhere in the water below it; one try per
+          // 1/60 s of model time (up to four a step), so the foam does not depend on the frame rate
+          let tries = min(4u, u32(ceil(dt*60.0 - 1e-4)));
+          for (var tr = 0u; tr < tries; tr++) { if (age >= 0.0) { break; }
           let i = min(u32(rnd(&sd)*f32(prm.nx)), prm.nx - 1u); let e = eta[i];
           if (e > 0.0 && dt > 0.0) {
             let atSurf = rnd(&sd) < 0.6;
@@ -607,12 +612,14 @@ fn face(cuu:f32, cu:f32, cd:f32) -> f32 { return cu + 0.5*vl(cu - cuu, cd - cu);
               let im = max(i, 1u) - 1u; let ip = min(i + 1u, prm.nx - 1u);
               let slope = select(0.0, abs(eta[ip] - eta[im])/(f32(ip - im)*prm.dx), eta[im] > 0.0 && eta[ip] > 0.0);
               if (atSurf) { m = max(m, max(up, smoothstep(0.25, 0.7, slope))); }
-              if (rnd(&sd) < m) {
+              // born at a rate, not per frame: 1 - exp(-m dt / tau), tau = 1/60 s keeps the look at 60 frames a second
+              if (rnd(&sd) < 1.0 - exp(-m*dt*60.0/f32(tries))) {
                 x = xb; z = zb; age = 0.0; vx = v.x; vz = v.y;
                 if (atSurf && up > 0.0) { vx = v.x*(1.0 + 0.3*rnd(&sd)); vz = v.y*(1.1 + 0.6*rnd(&sd)) + 0.1*sqrt(prm.g*h0)*rnd(&sd); }
               }
             }
           }
+        }
         } else if (dt > 0.0) {
           if (dry) { vz -= prm.g*dt; vx *= (1.0 - 0.5*dt); x += vx*dt; z += vz*dt; }
           else if (wet) { let v = vel(x, z); let rise = 0.04*sqrt(prm.g*h0);
@@ -795,11 +802,23 @@ fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
       let cc = select(0.0, 1.0, f0[c] > 0.5);
       var v = f[c] - (fl[c+N] - fl[c]) + cc*(w[c+N] - w[c])*prm.dt/prm.dx;
       if (v < 1e-6) { v = 0.0; } if (v > 1.0 - 1e-6) { v = 1.0; } f[c] = v;`),
-    surface: K([['f', 'f'], ['solid', 'u'], ['eta', 'f']], `if (c >= prm.nx) {return;} let i = c; let N = prm.nx;
+    // the connected surface: up from the bed through water (and overhanging solids), stepping over air
+    // pockets of up to two cells (an aerated roller still counts) but not over spray thrown higher
+    surface: K([['f', 'f'], ['solid', 'u'], ['eta', 'f']], `if (c >= prm.nx) {return;} let i = c; let N = prm.nx; let nz = i32(prm.nz);
+      var k = 0; while (k < nz && solid[i + N*u32(k)] != 0u) { k++; }
       var top = -1;
-      for (var k = i32(prm.nz) - 1; k >= 0; k--) { let q = i + N*u32(k); if (solid[q] == 0u && f[q] > 0.5) { top = k; break; } }
+      loop {
+        if (k >= nz) { break; }
+        let q = i + N*u32(k);
+        if (solid[q] != 0u) { k++; continue; }
+        if (f[q] > 0.5) { top = k; k++; continue; }
+        var more = false;
+        for (var j = 1; j <= 2; j++) { if (k + j < nz) { let qj = i + N*u32(k + j); if (solid[qj] == 0u && f[qj] > 0.5) { more = true; } } }
+        if (more) { k++; continue; }
+        break;
+      }
       if (top < 0) { eta[i] = -1.0; return; }
-      var above = 0.0; if (u32(top) + 1u < prm.nz) { above = f[i + N*(u32(top) + 1u)]; }
+      var above = 0.0; if (top + 1 < nz && solid[i + N*u32(top + 1)] == 0u) { above = f[i + N*u32(top + 1)]; }
       eta[i] = (f32(top) + f[i + N*u32(top)] + above)*prm.dx;`),
     tick: K([['tb', 'f']], `if (c == 0u) { tb[0] += prm.dt; }`),
     // per column, for the measured section: discharge q (m2/s), water depth h (water volume per unit
@@ -1312,8 +1331,8 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     const d = {
       classify: D('classify', P0, [B.f, B.solid, B.typ], N), clearSolid: D('clearSolid', P0, [B.f, B.solid], N),
       validU: D('validU', P0, [B.typ, B.uvA], NU), validW: D('validW', P0, [B.typ, B.wvA], NW),
-      exUab: D('extrapU', P0, [B.u, B.uvA, B.u2, B.uvB], NU), exUba: D('extrapU', P0, [B.u2, B.uvB, B.u, B.uvA], NU),
-      exWab: D('extrapW', P0, [B.w, B.wvA, B.w2, B.wvB], NW), exWba: D('extrapW', P0, [B.w2, B.wvB, B.w, B.wvA], NW),
+      exUab: D('extrapU', P0, [B.u, B.uvA, B.u2, B.uvB, B.f], NU), exUba: D('extrapU', P0, [B.u2, B.uvB, B.u, B.uvA, B.f], NU),
+      exWab: D('extrapW', P0, [B.w, B.wvA, B.w2, B.wvB, B.f], NW), exWba: D('extrapW', P0, [B.w2, B.wvB, B.w, B.wvA, B.f], NW),
       advU: D('advectU', P0, [B.u, B.w, B.u2], NU), advW: D('advectW', P0, [B.u, B.w, B.w2], NW),
       advFU: D('advFU', P0, [B.u, B.w, B.u2, B.typ], NU), advFW: D('advFW', P0, [B.u, B.w, B.w2, B.typ], NW),
       sedShear: D('sedShear', P0, [B.u, B.f, B.solid, B.bed, B.cell, B.qc, B.ust, SPU], nx),
