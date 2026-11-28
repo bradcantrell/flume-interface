@@ -88,6 +88,7 @@ registerModel({
   setRaster(r) { calls.setRaster++; calls.raster = r; },
   reset() { calls.reset++; },
   comb: { on: false, x: null }, setComb(x) { this.comb.x = x; }, combX() { return this.comb.x; },
+  wires: { on: false, xs: [] }, setWires(xs) { this.wires.xs = xs.slice(); }, wireXs() { return this.wires.xs; },
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
   render(v) { calls.render++; calls.view = v; },
   readouts() { return [['stub', 'ok']]; },
@@ -250,6 +251,9 @@ const run = (code) => vm.runInContext(code, sandbox);
   { const M0 = T.model; T.setTool('comb'); const [X, Y] = T.w2s(4.5, 0.3);
     T.onDown({ offsetX: X, offsetY: Y, button: 0 }); if (T.onUp) T.onUp({ offsetX: X, offsetY: Y, button: 0 });
     check('the comb tool places the smoke comb where clicked and turns the comb view on', Math.abs(M0.comb.x - 4.5) < 0.05 && M0.comb.on === true);
+    T.setTool('wire'); const at = (xx) => { const [Xw, Yw] = T.w2s(xx, 0.3); T.onDown({ offsetX: Xw, offsetY: Yw, button: 0 }); if (T.onUp) T.onUp({ offsetX: Xw, offsetY: Yw, button: 0 }); };
+    at(3); at(6); at(9); at(12); at(15); const five = M0.wires.xs.slice(); at(15);
+    check('the wire tool adds bubble wires (four at most, the oldest goes) and a click on a wire removes it', five.length === 4 && Math.abs(five[0] - 6) < 0.05 && M0.wires.xs.length === 3 && M0.wires.on === true);
     T.setTool('select'); }
   { const sb = viewButtons.find(b => b.dataset.view === 'streak'), M0 = T.model;
     sb.click(); const on = M0.streak === true && getEl('exposure-row').hidden === false;

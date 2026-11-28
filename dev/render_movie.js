@@ -1,6 +1,6 @@
 // Render a scene on the GPU (Dawn) to PNG frames and an MP4, for reviewing the look on real hardware.
 //   node dev/render_movie.js <scene: jump|waves> <out dir> [seconds] [fps]
-//   env: WARM (s of spin-up, default 4), STREAK=<exposure s> (long exposure on), COMB=1|<x m> (smoke comb on, at x), LIGHT, GAIN (its tuning), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
+//   env: WARM (s of spin-up, default 4), STREAK=<exposure s> (long exposure on), COMB=1|<x m> (smoke comb on, at x), WIRES=x1,x2 (bubble wires), LIGHT, GAIN (its tuning), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
 // Water and particles come from model.js's renderer (offscreen); solids and sediment are drawn on the
 // CPU the way the page draws them (black background, sand, grey solids), then ffmpeg makes the MP4.
 'use strict';
@@ -62,6 +62,7 @@ const SCENES = {
   const bpr = Math.ceil(W * 4 / 256) * 256, rb = M.device.createBuffer({ size: bpr * H, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   M.format = fmt; M.render_ = null;
   const parts = process.env.PARTS; if (parts === 'none') M.particles = false;
+  if (process.env.WIRES) { M.wires.on = true; M.setWires(process.env.WIRES.split(',').map(Number)); }
   if (process.env.COMB) { M.comb.on = true; if (process.env.COMB !== '1') M.setComb(+process.env.COMB); }
   if (process.env.STREAK) { M.streak = true; M.exposure = +process.env.STREAK; if (process.env.LIGHT) M.expLight = +process.env.LIGHT; if (process.env.GAIN) M.expGain = +process.env.GAIN; }
   else if (parts) M.drawKinds = parts;

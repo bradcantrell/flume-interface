@@ -420,6 +420,31 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('the smoke comb filaments build and draw', !rerr, rerr);
   }
 
+  // 25. bubble wire: in an empty river flume a timeline's displacement over its age is the velocity
+  // profile: each mark's speed matches the flow at its height, and the bed lags the surface
+  if (want('wire')) {
+    const zb = 0.02, h = 0.20, q = 0.06, rr = flume(6, 0.4, dx, (x, z) => (z < zb ? 1 : 0));
+    await setup(rr, { type: 'river', h0: zb + h, q, hout: h });
+    const dtp = stepFor(dx, 1.0); await M.debug.steps(Math.round(15 / dtp), dtp);
+    M.wires.on = true; M.setWires([1.5]); const Tr = M.wireInterval();
+    for (let t = 0; t < 2.5; t += 1 / 60) { await M.debug.steps(Math.max(1, Math.round((1 / 60) / dtp)), dtp); M.stepParticles(1 / 60); }
+    const WB = await M.debug.read('WB'), Wc = M.debug.wire(), u = await M.debug.read('u');
+    // the oldest live timeline
+    let best = -1, bestAge = 0; for (let r = 0; r < Wc.R; r++) { const a = WB[4 * (r * Wc.K) + 2]; if (a > bestAge) { bestAge = a; best = r; } }
+    let worst = 0, n = 0; const sp = [];
+    for (let k = 0; k < Wc.K; k++) {
+      const o = 4 * (best * Wc.K + k); if (WB[o + 2] <= 0) continue;
+      const xs = WB[o], zs = WB[o + 1], v = (xs - 1.5) / WB[o + 2];
+      const i = Math.round(((xs + 1.5) / 2) / dx), kk = Math.floor(zs / dx), uc = u[i + (rr.nx + 1) * kk];
+      sp.push([zs, v]); if (zs > zb + 0.03 && zs < zb + h - 0.03) { worst = Math.max(worst, Math.abs(v / uc - 1)); n++; }
+    }
+    const lowV = sp.length ? sp[0][1] : 0, topV = sp.length ? sp[sp.length - 1][1] : 0;
+    check('bubble wire: each mark of a timeline travels at the flow speed at its height (within 10%), the bed lagging the surface', n > 20 && worst < 0.10 && lowV < 0.85 * topV,
+      'timeline age ' + bestAge.toFixed(2) + ' s (release every ' + Tr.toFixed(2) + ' s), ' + n + ' marks, worst ' + (worst * 100).toFixed(1) + '%, bed ' + (lowV * 100).toFixed(1) + ' vs top ' + (topV * 100).toFixed(1) + ' cm/s');
+    const rerr = await M.debug.validateRender(400, 200); M.wires.on = false;
+    check('the bubble wire timelines build and draw', !rerr, rerr);
+  }
+
   // 23. restart: a river with a moving bed, dye and suspended sand, then reset with a bed readback in
   // flight; everything goes back to the design and the stale readback is not applied
   if (want('restart')) {

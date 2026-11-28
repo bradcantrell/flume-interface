@@ -75,6 +75,7 @@
       <button data-tool="erase" title="Eraser, carves water (7)"><svg viewBox="0 0 24 24"><path d="M8 20h12M5 15l8-9 6 6-8 8H9z"/></svg></button>
       <button data-tool="dye" title="Dye: click or drag to release dye (D)"><svg viewBox="0 0 24 24"><path d="M12 3c3 5 6 8 6 11a6 6 0 0 1-12 0c0-3 3-6 6-11z"/></svg></button>
       <button data-tool="comb" title="Smoke comb: click to place it (C)"><svg viewBox="0 0 24 24"><path d="M7 4v16M7 6h9M7 10h11M7 14h11M7 18h9"/></svg></button>
+      <button data-tool="wire" title="Bubble wire: click to add one, click a wire to remove it (W)"><svg viewBox="0 0 24 24"><path d="M12 3v18"/><circle cx="16" cy="6" r="1.2"/><circle cx="17" cy="10" r="1.2"/><circle cx="17.5" cy="14" r="1.2"/><circle cx="17" cy="18" r="1.2"/></svg></button>
       <button data-tool="gauge" title="Water-level gauge (9)"><svg viewBox="0 0 24 24"><path d="M12 3v18M8 7h8M9 11h6M8 15h8"/></svg></button>
       <button data-tool="bed" title="Edit the bed profile (8)"><svg viewBox="0 0 24 24"><path d="M3 16c4-5 6 1 9-3s5-1 9-4"/><circle cx="12" cy="13" r="1.6"/></svg></button>
     </div>
@@ -94,6 +95,7 @@
       <button data-view="levels" class="on" title="Named water levels and the crests of what you drew">levels</button>
       <button data-view="energy" class="on" title="River: the energy line, critical depth and where energy is lost. Waves: the mean water level">energy</button>
       <button data-view="comb" title="Smoke comb: filaments released across the depth, pulsed so the spacing of the marks shows speed (place it with the comb tool)">comb</button>
+      <button data-view="wire" title="Bubble wires: rows of marks released across the depth; each row bends into the velocity profile (place wires with the wire tool)">wire</button>
       <button data-view="streak" title="Long exposure: fine flakes carried by the water, exposed over a time you set, like a flow photograph">streak</button>
       <button data-view="grid" title="Elevation and distance marks with a faint metric grid">grid</button>
     </div>
@@ -582,6 +584,13 @@ function drawSection(c) {
       labels.push({ x: X + 4, y: Y0 + 12, t: 'comb', c: 'rgba(235,242,255,0.7)', align: 'left' });
     }
   }
+  if (VIEW.wire && model && model.wireXs) {
+    for (const xw of model.wireXs()) {
+      const X = Math.round(w2s(xw, 0)[0]) + 0.5;
+      c.strokeStyle = 'rgba(235,242,255,0.3)'; c.setLineDash([1, 2]); c.lineWidth = 1; c.beginPath(); c.moveTo(X, Y0); c.lineTo(X, Y1); c.stroke(); c.setLineDash([]);
+      labels.push({ x: X + 4, y: Y0 + 12, t: 'wire', c: 'rgba(235,242,255,0.65)', align: 'left' });
+    }
+  }
   c.restore(); c.setLineDash([]);
   // labels: small type in each line's colour, nudged apart so none overlap
   c.font = '10.5px system-ui, sans-serif'; c.textBaseline = 'alphabetic';
@@ -755,10 +764,11 @@ function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m 
 function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
 
 let showGrid = false;
-const VIEW = { levels: true, energy: true, comb: false, streak: false, grid: false };
+const VIEW = { levels: true, energy: true, comb: false, wire: false, streak: false, grid: false };
+let wires = [];          // bubble wire positions (m), up to four
 function setView(k, on) {
   VIEW[k] = on; for (const b of document.querySelectorAll('#view-toggles button')) if (b.dataset.view === k) b.classList.toggle('on', on);
-  if (k === 'grid') showGrid = on; if (k === 'streak') applyExposure(); if (k === 'comb' && model && model.comb) model.comb.on = on;
+  if (k === 'grid') showGrid = on; if (k === 'streak') applyExposure(); if (k === 'comb' && model && model.comb) model.comb.on = on; if (k === 'wire' && model && model.wires) model.wires.on = on;
 }
 // exposure slider: 0.02 s to 3 s on a log scale
 function exposureFromSlider(v) { return 0.02 * Math.pow(150, v / 100); }
@@ -926,6 +936,12 @@ function onDown(e) {
     polyPts.push([x, z]); return;
   }
   if (tool === 'comb') { if (model && model.setComb) model.setComb(clampX(x)); setView('comb', true); return; }
+  if (tool === 'wire') {
+    // a click on a wire removes it; anywhere else adds one (the oldest goes when there are four)
+    const hit = wires.findIndex(xw => Math.abs(w2s(xw, 0)[0] - w2s(x, 0)[0]) < 8);
+    if (hit >= 0) wires.splice(hit, 1); else { wires.push(clampX(x)); if (wires.length > 4) wires.shift(); }
+    if (model && model.setWires) model.setWires(wires); setView('wire', true); return;
+  }
   if (tool === 'dye') { drag = { kind: 'dye', x, z }; if (model && model.injectDye) model.injectDye(x, z, Math.max(brushW() / 2, GRID.dx)); return; }
   if (tool === 'gauge') {
     const g = gaugeAt(X);
@@ -1137,6 +1153,7 @@ const HINTS = {
   gauge: 'Click to place a water-level gauge. Drag one to move it, right-click to remove it.',
   dye: 'Click or drag in the water to release dye. It is carried by the flow.',
   comb: 'Click to place the smoke comb: filaments are released across the depth there.',
+  wire: 'Click to add a bubble wire (up to four); click a wire to remove it.',
 };
 function setTool(t) { if (polyPts && t !== 'poly') finishPoly(); tool = t; if (t !== 'select') selected = null; updatePanel(); }
 
@@ -1224,6 +1241,7 @@ function onKey(e) {
   if (k === 'r' || k === 'R') { restart(); return; }
   if (k === 'd' || k === 'D') { setTool('dye'); return; }
   if ((k === 'c' || k === 'C') && !e.ctrlKey && !e.metaKey) { setTool('comb'); return; }
+  if ((k === 'w' || k === 'W') && !e.ctrlKey && !e.metaKey) { setTool('wire'); return; }
   if (k >= '1' && k <= '9') { setTool(['select', 'brush', 'line', 'poly', 'rect', 'ellipse', 'erase', 'bed', 'gauge'][+k - 1]); return; }
   if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
   if (k === 'Escape') { polyPts = null; drag = null; selected = null; updatePanel(); return; }
@@ -1287,7 +1305,7 @@ function wire() {
     f.text().then((t) => { if (!openSceneText(t)) alert('That file is not a flume scene.'); e.target.value = ''; });
   });
   // clear: an empty flume with still water (the drawing goes on the undo stack)
-  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.gauges = []; clearGaugeData(); scene.bed = defaultBed(DOMAIN); selected = null; sceneChanged(); restart(); });
+  $('clear').addEventListener('click', () => { pushUndo(); scene.shapes = []; scene.gauges = []; clearGaugeData(); scene.bed = defaultBed(DOMAIN); selected = null; wires = []; if (model && model.setWires) model.setWires(wires); sceneChanged(); restart(); });
   const gc = $('gauge-cv');
   gc.addEventListener('pointermove', gaugeTip);
   gc.addEventListener('pointerleave', () => { gaugeHover = null; $('gauge-tip').hidden = true; });

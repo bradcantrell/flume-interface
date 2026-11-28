@@ -17,7 +17,8 @@
   'use strict';
 
   const G = 9.81;
-  const COMB = { S: 14, M: 600, P: 10, te: 1 / 60 };     // smoke comb: release points, ring length, pulse every P, release interval (s)
+  const COMB = { S: 14, M: 600, P: 10, te: 1 / 60 };
+  const WIRE = { W: 4, R: 16, K: 48 };                     // bubble wires: wires, timelines kept per wire, marks per timeline     // smoke comb: release points, ring length, pulse every P, release interval (s)
   const K_CG = 8;            // CG iterations per step (8 reaches the single-precision floor, see spike)
   const CFL = 0.4;
   const NU_WATER = 1e-6;     // m2/s
@@ -650,6 +651,27 @@ fn shearAt(x:f32, z:f32) -> f32 { let d = prm.dx; return abs(sU(x, z + d) - sU(x
 fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
 fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
 `),
+    // Bubble wire (the hydrogen-bubble technique): at each release every wire puts out a row of K
+    // marks across the depth at once; the row is a timeline whose bending is the velocity profile.
+    // WU: 0 dt, 1 release now, 2 slot n, 3 -, 4 wires, 5 R, 6 K, 7 -, 8..11 wire x
+    wireStep: K([['u', 'f'], ['w', 'f'], ['f', 'f'], ['solid', 'u'], ['eta', 'f'], ['WB', 'f'], ['WU', 'U']], `let nW = u32(spv(4u)); let R = u32(spv(5u)); let Kk = u32(spv(6u)); if (c >= nW*R*Kk) {return;}
+      let wi = c / (R*Kk); let r = (c / Kk) % R; let k = c % Kk; let o = 4u*c; let dt = spv(0u);
+      var x = WB[o]; var z = WB[o+1u]; var age = WB[o+2u];
+      if (spv(1u) > 0.5 && r == u32(spv(2u))) {
+        let xw = spv(8u + wi); let i = u32(clamp(xw/prm.dx, 0.0, f32(prm.nx) - 1.0));
+        var kb = 0u; while (kb < prm.nz && solid[i + prm.nx*kb] != 0u) { kb++; }
+        let zb = f32(kb)*prm.dx; let e = eta[i];
+        if (e > zb + 3.0*prm.dx) { x = xw; z = zb + 0.5*prm.dx + (f32(k) + 0.5)/f32(Kk)*(e - zb - 1.5*prm.dx); age = 0.0; } else { age = -1.0; }
+      } else if (age >= 0.0 && dt > 0.0) {
+        let v1 = vel(x, z); let v2 = vel(x + 0.5*dt*v1.x, z + 0.5*dt*v1.y); x += dt*v2.x; z += dt*v2.y; age += dt;
+        let L = f32(prm.nx)*prm.dx; let Hd = f32(prm.nz)*prm.dx;
+        if (!(x > 0.0 && x < L && z > 0.0 && z < Hd)) { age = -1.0; } else if (solid[cellOf(x, z)] != 0u || fAt2(x, z) < 0.5) { age = -1.0; }
+      }
+      WB[o] = x; WB[o+1u] = z; WB[o+2u] = age; WB[o+3u] = f32(r);`,
+      SAMPLE + `fn cellOf(x:f32, z:f32) -> u32 { let i = u32(clamp(x/prm.dx, 0.0, f32(prm.nx) - 1.0)); let k = u32(clamp(z/prm.dx, 0.0, f32(prm.nz) - 1.0)); return i + prm.nx*k; }
+fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
+fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
+`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -1052,6 +1074,36 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
 }
 @fragment fn fs(in: VO) -> @location(0) vec4f { let c = vec3f(0.93, 0.96, 1.0)*in.a; return vec4f(c, in.a); }`;
 
+  // bubble wire timelines: a segment from each mark to the next one up the same row; brightest when
+  // just released, fading as the row ages
+  const WIRE_LINE = `
+struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32, nz:f32, mode:f32, H:f32, time:f32, umax:f32, depthRef:f32, dpr:f32 };
+@group(0) @binding(0) var<uniform> V0: V;
+@group(0) @binding(1) var<storage, read> P: array<f32>;
+@group(0) @binding(2) var<uniform> C: vec4f;          // newest slot, R, K, -
+struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  var out: VO; out.a = 0.0; out.pos = vec4f(2.0, 2.0, 0.0, 1.0);
+  let R = u32(C.y); let Kk = u32(C.z); let k = ii % Kk; let r = (ii / Kk) % R;
+  if (k + 1u >= Kk) { return out; }
+  let o = 4u*ii; let op = 4u*(ii + 1u);
+  if (P[o+2u] < 0.0 || P[op+2u] < 0.0) { return out; }
+  let ax = (P[o] - V0.x0)*V0.s; let ay = V0.ch - (P[o+1u] - V0.z0)*V0.s*V0.ve;
+  let bx = (P[op] - V0.x0)*V0.s; let by = V0.ch - (P[op+1u] - V0.z0)*V0.s*V0.ve;
+  let d = vec2f(bx - ax, by - ay); let len = length(d);
+  if (len > 40.0*V0.dpr) { return out; }
+  var dir = vec2f(0.0, -1.0); if (len > 1e-4) { dir = d/len; }
+  let hw = 0.6*V0.dpr; let nrm = vec2f(-dir.y, dir.x);
+  let corners = array<vec2f, 6>(vec2f(0.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+  let cc = corners[vi]; let ext = max(len, 0.5*V0.dpr);
+  let p = vec2f(ax, ay) + dir*ext*cc.x + nrm*hw*cc.y;
+  out.pos = vec4f(p.x/V0.cw*2.0 - 1.0, 1.0 - p.y/V0.ch*2.0, 0.0, 1.0);
+  let older = f32((u32(C.x) + R - r) % R)/f32(R);
+  out.a = 0.9*pow(1.0 - older, 1.3);
+  return out;
+}
+@fragment fn fs(in: VO) -> @location(0) vec4f { let c = vec3f(0.95, 0.97, 1.0)*in.a; return vec4f(c, in.a); }`;
+
   // ───────────────────────── wave theory ─────────────────────────
   function waveNumber(omega, h) {           // omega^2 = g k tanh(k h)
     let k = omega * omega / G; if (h <= 0) return k;
@@ -1220,7 +1272,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), PS: buf(8 * Math.max(20000, Math.min(150000, Math.round(N * 0.6)))), CB: buf(4 * COMB.S * COMB.M), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), PS: buf(8 * Math.max(20000, Math.min(150000, Math.round(N * 0.6)))), CB: buf(4 * COMB.S * COMB.M), WB: buf(4 * WIRE.W * WIRE.R * WIRE.K), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx), egl: buf(3 * nx),
     };
     const P0 = ubuf();
@@ -1229,6 +1281,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     const PU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const PU2 = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const CU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const WU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const nS = Math.max(20000, Math.min(150000, Math.round(N * 0.6)));
     const nT = Math.max(3000, Math.min(20000, Math.round(N / 10))), nF = 16000;
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
@@ -1273,6 +1326,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       partStep: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.P, PU], nT + nF),
       partStepS: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.PS, PU2], nS),
       combStep: D('combStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.CB, CU], COMB.S * COMB.M),
+      wireStep: D('wireStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.WB, WU], WIRE.W * WIRE.R * WIRE.K),
       plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
@@ -1299,7 +1353,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, SPU, DIU, PU, PU2, CU, nT, nF, nS, N, NU, NW, all: all.concat([P0, SPU, DIU, PU, PU2, CU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, DIU, PU, PU2, CU, WU, nT, nF, nS, N, NU, NW, all: all.concat([P0, SPU, DIU, PU, PU2, CU, WU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -1415,7 +1469,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0]; M.colHost = null;
     if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz);
       const ps = new Float32Array(8 * M.S.nS); for (let j = 0; j < M.S.nS; j++) ps[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.PS, 0, ps); }
-    M.expClear = true; clearComb();
+    M.expClear = true; clearComb(); clearWires();
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
@@ -1583,6 +1637,32 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.combStep); ps.end(); M.device.queue.submit([e.finish()]);
     }
   }
+  // bubble wires: up to four, placed by the interface; a release every Tr seconds, Tr chosen so a
+  // timeline moves about a quarter depth between releases (waves: an eighth of a period)
+  M.wires = { on: false, xs: [], n: -1, count: 0, acc: 0 };
+  M.setWires = function (xs) { M.wires.xs = xs.slice(0, WIRE.W); clearWires(); };
+  M.wireXs = function () {
+    if (M.wires.xs.length) return M.wires.xs;
+    return M.grid ? [(M.p.type === 'wave' ? 0.3 : 0.25) * M.grid.nx * M.grid.dx] : [];
+  };
+  M.wireInterval = function () {
+    const p = M.p, h = Math.max(p.h0 - (M.P ? M.P.zin : 0), M.grid ? 4 * M.grid.dx : 0.05);
+    if (p.type === 'wave') return Math.max(0.05, (p.T || 2) / 8);
+    return Math.min(3, Math.max(0.08, 0.25 * h / Math.max(p.q / h, 0.02)));
+  };
+  function clearWires() {
+    M.wires.n = -1; M.wires.count = 0; M.wires.acc = 1e9;   // release at once on the next step
+    if (M.S) { const z = new Float32Array(4 * WIRE.W * WIRE.R * WIRE.K); for (let j = 0; j < WIRE.W * WIRE.R * WIRE.K; j++) z[4 * j + 2] = -1; M.device.queue.writeBuffer(M.S.B.WB, 0, z); }
+  }
+  function stepWires(dtp) {
+    if (!M.wires.on || !(dtp > 0)) return;
+    const Wr = M.wires, xs = M.wireXs(), Tr = M.wireInterval();
+    Wr.acc = Math.min(Wr.acc + dtp, Tr + dtp);
+    const rel = Wr.acc >= Tr ? 1 : 0; if (rel) { Wr.acc = 0; Wr.n = (Wr.n + 1) % WIRE.R; Wr.count++; }
+    const u = new Float32Array(16); u.set([dtp, rel, Math.max(Wr.n, 0), 0, xs.length, WIRE.R, WIRE.K, 0]); for (let j = 0; j < xs.length; j++) u[8 + j] = xs[j];
+    M.device.queue.writeBuffer(M.S.WU, 0, u);
+    const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.wireStep); ps.end(); M.device.queue.submit([e.finish()]);
+  }
   M.stepParticles = function (dtp) {
     if (!M.ok || !M.S || M.particles === false) return;
     M.pFrame = (M.pFrame || 0) + 1;
@@ -1592,7 +1672,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     if (M.streak) { M.device.queue.writeBuffer(M.S.PU2, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nS, 0, hh, 7919, 0, 0, 0, 0, 0, 0, 0, 0, 0])); run(ps, M.S.d.partStepS); }
     ps.end(); M.device.queue.submit([e.finish()]);
     M.pAdvance = (M.pAdvance || 0) + dtp;          // model time the exposure has to take in at the next draw
-    stepComb(dtp);
+    stepComb(dtp); stepWires(dtp);
   };
   // dye tool: release dye in a disc at (x, z) of radius r (m)
   M.injectDye = function (x, z, r) {
@@ -1766,6 +1846,18 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       M.device.queue.writeBuffer(M.render_.cU, 0, new Float32Array([Math.max(M.comb.n, 0), COMB.M, COMB.P, 0]));
       pass.setPipeline(M.render_.cp); pass.setBindGroup(0, M.render_.cbg); pass.draw(6, COMB.S * COMB.M);
     }
+    if (M.wires.on) {
+      if (!M.render_.wp || M.render_.wpBuf !== M.S.B.WB) {
+        const wm = M.device.createShaderModule({ code: WIRE_LINE });
+        const wp = M.render_.wp || M.device.createRenderPipeline({ layout: 'auto', vertex: { module: wm, entryPoint: 'vs' },
+          fragment: { module: wm, entryPoint: 'fs', targets: [{ format: M.format, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] }, primitive: { topology: 'triangle-list' } });
+        const wU = M.render_.wU || M.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        M.render_.wp = wp; M.render_.wU = wU; M.render_.wpBuf = M.S.B.WB;
+        M.render_.wbg = M.device.createBindGroup({ layout: wp.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: M.render_.U } }, { binding: 1, resource: { buffer: M.S.B.WB } }, { binding: 2, resource: { buffer: wU } }] });
+      }
+      M.device.queue.writeBuffer(M.render_.wU, 0, new Float32Array([Math.max(M.wires.n, 0), WIRE.R, WIRE.K, 0]));
+      pass.setPipeline(M.render_.wp); pass.setBindGroup(0, M.render_.wbg); pass.draw(6, M.wireXs().length * WIRE.R * WIRE.K);
+    }
     if (M.particles !== false) {
       // with the exposure on, its flakes replace the tracers; foam stays
       const k = exp ? 'foam' : M.drawKinds;
@@ -1868,7 +1960,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     },
     write(name, data) { M.device.queue.writeBuffer(M.S.B[name], 0, data); },
     readBed() { readBed(); },                // start the page's bed readback (for the restart check)
-    comb: () => COMB,
+    comb: () => COMB, wire: () => WIRE,
     async readColumns() { readColumns(); while (M.colBusy) await new Promise(r => setTimeout(r, 2)); },
     async read(name) {
       const B = M.S.B[name], n = B.size / 4;
