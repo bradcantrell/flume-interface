@@ -1,6 +1,6 @@
 // Render a scene on the GPU (Dawn) to PNG frames and an MP4, for reviewing the look on real hardware.
 //   node dev/render_movie.js <scene: jump|waves> <out dir> [seconds] [fps]
-//   env: WARM (s of spin-up, default 4), STREAK=<exposure s> (long exposure on), LIGHT, GAIN (its tuning), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
+//   env: WARM (s of spin-up, default 4), STREAK=<exposure s> (long exposure on), COMB=1|<x m> (smoke comb on, at x), LIGHT, GAIN (its tuning), PARTS=tracers|foam|none (draw one kind only, for tuning), FRAMES=a,b (stills only)
 // Water and particles come from model.js's renderer (offscreen); solids and sediment are drawn on the
 // CPU the way the page draws them (black background, sand, grey solids), then ffmpeg makes the MP4.
 'use strict';
@@ -20,6 +20,9 @@ const SCENES = {
   // a sluice gate and a hydraulic jump, then a sill downstream
   jump: { L: 8, H: 0.6, dx: 0.01, p: { type: 'river', h0: 0.07, q: 0.10, hout: 0.19, sediment: false },
     paint: (x, z) => (z < 0.02 ? 1 : (x < 0.15 && z > 0.06) ? 1 : (x > 5.6 && x < 5.9 && z < 0.10) ? 1 : 0), view: { x0: -0.12, z0: -0.025, L: 4.8, ve: 3, H: 440 }, crests: [[5.6, 5.9, 0.10]] },
+  // subcritical flow over a block: lift over the crest and the separation eddy behind it
+  block: { L: 6, H: 0.5, dx: 0.008, p: { type: 'river', h0: 0.30, q: 0.07, hout: 0.27, sediment: false },
+    paint: (x, z) => (z < 0.02 ? 1 : (x > 2.4 && x < 2.7 && z < 0.16) ? 1 : 0), view: { x0: 0.6, z0: -0.01, L: 4.2, ve: 2, H: 420 }, crests: [[2.4, 2.7, 0.16]] },
   // waves over a submerged reef breaking on a sand beach
   waves: { L: 20, H: 1.0, dx: 0.0125, p: { type: 'wave', h0: 0.45, H: 0.12, T: 2.2, farEnd: 'beach', absorb: true, sediment: false },
     paint: (x, z) => { const bed = x < 9 ? 0.06 : 0.06 + (x - 9) * 0.07; if (z < bed) return 4; if (x > 6.5 && x < 7.8 && z < 0.32 - Math.abs(x - 7.15) * 0.3) return 1; return 0; }, view: { x0: 5.2, z0: -0.04, L: 10.8, ve: 3, H: 400 }, crests: [[6.5, 7.8, 0.32]] },
@@ -59,6 +62,7 @@ const SCENES = {
   const bpr = Math.ceil(W * 4 / 256) * 256, rb = M.device.createBuffer({ size: bpr * H, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   M.format = fmt; M.render_ = null;
   const parts = process.env.PARTS; if (parts === 'none') M.particles = false;
+  if (process.env.COMB) { M.comb.on = true; if (process.env.COMB !== '1') M.setComb(+process.env.COMB); }
   if (process.env.STREAK) { M.streak = true; M.exposure = +process.env.STREAK; if (process.env.LIGHT) M.expLight = +process.env.LIGHT; if (process.env.GAIN) M.expGain = +process.env.GAIN; }
   else if (parts) M.drawKinds = parts;
   const dt = 0.4 * dx / 1.5, perFrame = 1 / fps, warm = +(process.env.WARM || 4);

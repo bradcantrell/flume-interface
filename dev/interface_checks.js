@@ -87,6 +87,7 @@ registerModel({
   setGrid(g, r) { calls.setGrid++; calls.grid = g; calls.raster = r; },
   setRaster(r) { calls.setRaster++; calls.raster = r; },
   reset() { calls.reset++; },
+  comb: { on: false, x: null }, setComb(x) { this.comb.x = x; }, combX() { return this.comb.x; },
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
   render(v) { calls.render++; calls.view = v; },
   readouts() { return [['stub', 'ok']]; },
@@ -246,6 +247,10 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const M0 = T.model; T.setTool('comb'); const [X, Y] = T.w2s(4.5, 0.3);
+    T.onDown({ offsetX: X, offsetY: Y, button: 0 }); if (T.onUp) T.onUp({ offsetX: X, offsetY: Y, button: 0 });
+    check('the comb tool places the smoke comb where clicked and turns the comb view on', Math.abs(M0.comb.x - 4.5) < 0.05 && M0.comb.on === true);
+    T.setTool('select'); }
   { const sb = viewButtons.find(b => b.dataset.view === 'streak'), M0 = T.model;
     sb.click(); const on = M0.streak === true && getEl('exposure-row').hidden === false;
     getEl('exposure').value = '100'; getEl('exposure').dispatch('input'); const tl = M0.exposure;

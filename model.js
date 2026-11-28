@@ -17,6 +17,7 @@
   'use strict';
 
   const G = 9.81;
+  const COMB = { S: 14, M: 600, P: 10, te: 1 / 60 };     // smoke comb: release points, ring length, pulse every P, release interval (s)
   const K_CG = 8;            // CG iterations per step (8 reaches the single-precision floor, see spike)
   const CFL = 0.4;
   const NU_WATER = 1e-6;     // m2/s
@@ -627,6 +628,28 @@ fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
 fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
 fn shearAt(x:f32, z:f32) -> f32 { let d = prm.dx; return abs(sU(x, z + d) - sU(x, z - d))/(2.0*d) + abs(sW(x + d, z) - sW(x - d, z))/(2.0*d); }
 `),
+    // Smoke comb (after Marey's smoke machine): S release points spread over the depth at x = xc, each
+    // a ring of M particles; every emission resets slot n of every ring to its release point, so each
+    // ring traced in slot order is a streakline. Particles that reach air, a solid or the ends stop.
+    // CU: 0 dt, 1 emit now, 2 slot n, 3 xc, 4 S, 5 M, 6 emission count
+    combStep: K([['u', 'f'], ['w', 'f'], ['f', 'f'], ['solid', 'u'], ['eta', 'f'], ['CB', 'f'], ['CU', 'U']], `let S = u32(spv(4u)); let Mm = u32(spv(5u)); if (c >= S*Mm) {return;}
+      let s = c / Mm; let j = c % Mm; let o = 4u*c; let dt = spv(0u);
+      var x = CB[o]; var z = CB[o+1u]; var age = CB[o+2u]; var cnt = CB[o+3u];
+      if (spv(1u) > 0.5 && j == u32(spv(2u))) {
+        let i = u32(clamp(spv(3u)/prm.dx, 0.0, f32(prm.nx) - 1.0));
+        var kb = 0u; while (kb < prm.nz && solid[i + prm.nx*kb] != 0u) { kb++; }
+        let zb = f32(kb)*prm.dx; let e = eta[i];
+        if (e > zb + 3.0*prm.dx) { x = spv(3u); z = zb + prm.dx + (f32(s) + 0.5)/f32(S)*(e - zb - 2.0*prm.dx); age = 0.0; cnt = spv(6u); } else { age = -1.0; }
+      } else if (age >= 0.0 && dt > 0.0) {
+        let v1 = vel(x, z); let v2 = vel(x + 0.5*dt*v1.x, z + 0.5*dt*v1.y); x += dt*v2.x; z += dt*v2.y; age += dt;
+        let L = f32(prm.nx)*prm.dx; let Hd = f32(prm.nz)*prm.dx;
+        if (!(x > 0.0 && x < L && z > 0.0 && z < Hd)) { age = -1.0; } else if (solid[cellOf(x, z)] != 0u || fAt2(x, z) < 0.5) { age = -1.0; }
+      }
+      CB[o] = x; CB[o+1u] = z; CB[o+2u] = age; CB[o+3u] = cnt;`,
+      SAMPLE + `fn cellOf(x:f32, z:f32) -> u32 { let i = u32(clamp(x/prm.dx, 0.0, f32(prm.nx) - 1.0)); let k = u32(clamp(z/prm.dx, 0.0, f32(prm.nz) - 1.0)); return i + prm.nx*k; }
+fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
+fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
+`),
     // river (mode 0): the discharge q comes in over the wet depth at the inlet; the outlet passes
     // q plus a radiating correction toward the tailwater level (hout), so long waves leave.
     // wave (mode 1): piston paddle at x = 0, closed far end (the sponge takes the waves out).
@@ -995,6 +1018,40 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
   return vec4f(col, l*0.95);
 }`;
 
+  // smoke comb filaments: a segment from each particle to the one released before it on the same ring;
+  // pulse marks (every Pth release) drawn brighter and wider; older smoke fades
+  const COMB_LINE = `
+struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32, nz:f32, mode:f32, H:f32, time:f32, umax:f32, depthRef:f32, dpr:f32 };
+@group(0) @binding(0) var<uniform> V0: V;
+@group(0) @binding(1) var<storage, read> P: array<f32>;
+@group(0) @binding(2) var<uniform> C: vec4f;          // newest slot, M, P, -
+struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  var out: VO; out.a = 0.0; out.pos = vec4f(2.0, 2.0, 0.0, 1.0);
+  let Mm = u32(C.y); let j = ii % Mm; let n = u32(C.x);
+  if (j == (n + 1u) % Mm) { return out; }
+  let jp = select(j - 1u, Mm - 1u, j == 0u); let ip = ii - j + jp;
+  let o = 4u*ii; let op = 4u*ip;
+  if (P[o+2u] < 0.0 || P[op+2u] < 0.0) { return out; }
+  let ax = (P[o] - V0.x0)*V0.s; let ay = V0.ch - (P[o+1u] - V0.z0)*V0.s*V0.ve;
+  let bx = (P[op] - V0.x0)*V0.s; let by = V0.ch - (P[op+1u] - V0.z0)*V0.s*V0.ve;
+  let d = vec2f(bx - ax, by - ay); let len = length(d);
+  if (len > 14.0*V0.dpr) { return out; }          // torn apart: the smoke has dispersed
+  var dir = vec2f(1.0, 0.0); if (len > 1e-4) { dir = d/len; }
+  let pulse = (u32(P[o+3u]) % u32(C.z)) == 0u;
+  // a stretched filament thins (the same smoke over a longer line), so it fades with its stretch
+  let thin = clamp(5.0*V0.dpr/max(len, 1e-3), 0.0, 1.0);
+  let hw = select(0.55, 1.1, pulse)*V0.dpr; let nrm = vec2f(-dir.y, dir.x);
+  let corners = array<vec2f, 6>(vec2f(0.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, -1.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+  let cc = corners[vi]; let ext = max(len, select(0.5, 2.0, pulse)*V0.dpr);
+  let p = vec2f(ax, ay) + dir*ext*cc.x + nrm*hw*cc.y;
+  out.pos = vec4f(p.x/V0.cw*2.0 - 1.0, 1.0 - p.y/V0.ch*2.0, 0.0, 1.0);
+  let older = f32((n + Mm - j) % Mm)/f32(Mm);     // 0 newest .. 1 oldest
+  out.a = select(0.62, 1.0, pulse)*(1.0 - smoothstep(0.35, 1.0, older))*pow(thin, 1.5);
+  return out;
+}
+@fragment fn fs(in: VO) -> @location(0) vec4f { let c = vec3f(0.93, 0.96, 1.0)*in.a; return vec4f(c, in.a); }`;
+
   // ───────────────────────── wave theory ─────────────────────────
   function waveNumber(omega, h) {           // omega^2 = g k tanh(k h)
     let k = omega * omega / G; if (h <= 0) return k;
@@ -1163,7 +1220,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       f: buf(N), f0: buf(N), solid: buf(N), typ: buf(N),
       u: buf(NU), u2: buf(NU), uvA: buf(NU), uvB: buf(NU), w: buf(NW), w2: buf(NW), wvA: buf(NW), wvB: buf(NW),
       flx: buf(Math.max(NU, NW)), p: buf(N), r: buf(N), z: buf(N), s: buf(N), q: buf(N), tmp: buf(N), nt: buf(N), dgX: buf(2 * N), dgZ: buf(2 * N), ks: buf(N), BU: buf(NU), BW: buf(NW), uM: buf(NU), wM: buf(NW),
-      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), PS: buf(8 * Math.max(20000, Math.min(150000, Math.round(N * 0.6)))), cs: buf(3 * N), cs2: buf(3 * N),
+      bed: buf(3 * nx), cell: buf(4 * N), colx: buf(6 * nx), qc: buf(3 * nx), qb: buf(3 * (nx + 1)), ust: buf(nx), ustK: buf(nx), pl: buf(5 * nx), pf: buf(N), po: buf(2 * nx), dye: buf(N), dye2: buf(N), P: buf(8 * (Math.max(3000, Math.min(20000, Math.round(N / 10))) + 16000)), PS: buf(8 * Math.max(20000, Math.min(150000, Math.round(N * 0.6)))), CB: buf(4 * COMB.S * COMB.M), cs: buf(3 * N), cs2: buf(3 * N),
       part: buf(Math.ceil(N / 256) + 1), scal: buf(8), tb: buf(4), eta: buf(nx), egl: buf(3 * nx),
     };
     const P0 = ubuf();
@@ -1171,6 +1228,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     const DIU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const PU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const PU2 = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const CU = M.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const nS = Math.max(20000, Math.min(150000, Math.round(N * 0.6)));
     const nT = Math.max(3000, Math.min(20000, Math.round(N / 10))), nF = 16000;
     const L = [{ nx, nz, typ: B.typ, x: B.z, b: B.r, r: buf(N) }];
@@ -1214,6 +1272,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       dyeInject: D('dyeInject', P0, [B.f, B.solid, B.dye, DIU], N),
       partStep: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.P, PU], nT + nF),
       partStepS: D('partStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.PS, PU2], nS),
+      combStep: D('combStep', P0, [B.u, B.w, B.f, B.solid, B.eta, B.CB, CU], COMB.S * COMB.M),
       plantBend: D('plantBend', P0, [B.u, B.pl, B.pf, B.po], nx),
       susAdv: D('susAdv', P0, [B.u, B.w, B.typ, B.cs, B.cs2, B.ustK, B.bed, B.eta, SPU], N),
       susBed: D('susBed', P0, [B.f, B.solid, B.bed, B.cell, B.cs, B.colx, B.ust, B.ustK, SPU], nx),
@@ -1240,7 +1299,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       redVol: D('red', P0, [B.f, B.part], N, { OP: 0 }, 256), finVol: D('fin', P0, [B.part, B.scal], 256, { SLOT: 6, OP: 0 }, 256),
       redMax: D('red', P0, [B.tmp, B.part], N, { OP: 1 }, 256), finMax: D('fin', P0, [B.part, B.scal], 256, { SLOT: 7, OP: 1 }, 256),
     };
-    M.S = { B, L, d, P0, SPU, DIU, PU, PU2, nT, nF, nS, N, NU, NW, all: all.concat([P0, SPU, DIU, PU, PU2], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
+    M.S = { B, L, d, P0, SPU, DIU, PU, PU2, CU, nT, nF, nS, N, NU, NW, all: all.concat([P0, SPU, DIU, PU, PU2, CU], L.flatMap(v => [v.U, v.UC].filter(Boolean))) };
     M.grid = grid;
     M.render_ = null;
     if (raster) M.setRaster(raster);
@@ -1356,7 +1415,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     M.t = 0; M.etaHost = null; M.plantHost = null; M.dyeOn = false; M.zsHost = null; M.bedRange = [0, 0]; M.colHost = null;
     if (M.S) { const pz = new Float32Array(8 * (M.S.nT + M.S.nF)); for (let j = 0; j < M.S.nT + M.S.nF; j++) pz[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.P, 0, pz);
       const ps = new Float32Array(8 * M.S.nS); for (let j = 0; j < M.S.nS; j++) ps[8 * j + 6] = -1; M.device.queue.writeBuffer(M.S.B.PS, 0, ps); }
-    M.expClear = true;
+    M.expClear = true; clearComb();
     if (M.S) M.device.queue.writeBuffer(M.S.B.dye, 0, new Float32Array(M.S.N));
     if (!M.ok || !M.S || !M.grid) return;
     const { nx, nz, dx } = M.grid, N = nx * nz, f = new Float32Array(N), sol = M.solidHost || new Uint32Array(N);
@@ -1499,6 +1558,31 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       M.bedBusy = false;
     }, () => { M.bedBusy = false; });
   }
+  // the smoke comb: 14 release points, rings of 600 (10 s of filament at one emission per 1/60 s of
+  // model time); every 10th particle is a pulse mark (Marey's chronograph), so the spacing of the
+  // marks along a filament is its speed
+  M.comb = { on: false, x: null, n: -1, count: 0, acc: 0 };
+  M.setComb = function (x) { M.comb.x = x; clearComb(); };
+  function clearComb() {
+    M.comb.n = -1; M.comb.count = 0; M.comb.acc = 0;
+    if (M.S) { const z = new Float32Array(4 * COMB.S * COMB.M); for (let j = 0; j < COMB.S * COMB.M; j++) z[4 * j + 2] = -1; M.device.queue.writeBuffer(M.S.B.CB, 0, z); }
+  }
+  M.combX = function () {
+    if (M.comb.x != null) return M.comb.x;
+    return M.grid ? (M.p.type === 'wave' ? 0.3 : 0.04) * M.grid.nx * M.grid.dx : null;
+  };
+  function stepComb(dtp) {
+    if (!M.comb.on || !(dtp > 0)) return;
+    const C = M.comb; C.acc += dtp;
+    const k = Math.min(8, Math.floor(C.acc / COMB.te)); C.acc -= k * COMB.te;
+    const xs = M.combX(), parts = Math.max(k, 1);
+    for (let j = 0; j < parts; j++) {
+      const emit = j < k ? 1 : 0;
+      if (emit) { C.n = (C.n + 1) % COMB.M; C.count++; }
+      M.device.queue.writeBuffer(M.S.CU, 0, new Float32Array([dtp / parts, emit, Math.max(C.n, 0), xs, COMB.S, COMB.M, C.count, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+      const e = M.device.createCommandEncoder(), ps = e.beginComputePass(); run(ps, M.S.d.combStep); ps.end(); M.device.queue.submit([e.finish()]);
+    }
+  }
   M.stepParticles = function (dtp) {
     if (!M.ok || !M.S || M.particles === false) return;
     M.pFrame = (M.pFrame || 0) + 1;
@@ -1508,6 +1592,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     if (M.streak) { M.device.queue.writeBuffer(M.S.PU2, 0, new Float32Array([dtp, M.t, M.pFrame, M.S.nS, 0, hh, 7919, 0, 0, 0, 0, 0, 0, 0, 0, 0])); run(ps, M.S.d.partStepS); }
     ps.end(); M.device.queue.submit([e.finish()]);
     M.pAdvance = (M.pAdvance || 0) + dtp;          // model time the exposure has to take in at the next draw
+    stepComb(dtp);
   };
   // dye tool: release dye in a disc at (x, z) of radius r (m)
   M.injectDye = function (x, z, r) {
@@ -1669,6 +1754,18 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     const pass = enc.beginRenderPass({ colorAttachments: [{ view: tgt.createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
     pass.setPipeline(M.render_.p); pass.setBindGroup(0, M.render_.bg); pass.draw(3);
     if (exp) { pass.setPipeline(exp.p); pass.setBindGroup(0, exp.bg); pass.draw(3); }
+    if (M.comb.on) {
+      if (!M.render_.cp || M.render_.cpBuf !== M.S.B.CB) {
+        const cm = M.device.createShaderModule({ code: COMB_LINE });
+        const cp = M.render_.cp || M.device.createRenderPipeline({ layout: 'auto', vertex: { module: cm, entryPoint: 'vs' },
+          fragment: { module: cm, entryPoint: 'fs', targets: [{ format: M.format, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] }, primitive: { topology: 'triangle-list' } });
+        const cU = M.render_.cU || M.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        M.render_.cp = cp; M.render_.cU = cU; M.render_.cpBuf = M.S.B.CB;
+        M.render_.cbg = M.device.createBindGroup({ layout: cp.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: M.render_.U } }, { binding: 1, resource: { buffer: M.S.B.CB } }, { binding: 2, resource: { buffer: cU } }] });
+      }
+      M.device.queue.writeBuffer(M.render_.cU, 0, new Float32Array([Math.max(M.comb.n, 0), COMB.M, COMB.P, 0]));
+      pass.setPipeline(M.render_.cp); pass.setBindGroup(0, M.render_.cbg); pass.draw(6, COMB.S * COMB.M);
+    }
     if (M.particles !== false) {
       // with the exposure on, its flakes replace the tracers; foam stays
       const k = exp ? 'foam' : M.drawKinds;
@@ -1771,6 +1868,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     },
     write(name, data) { M.device.queue.writeBuffer(M.S.B[name], 0, data); },
     readBed() { readBed(); },                // start the page's bed readback (for the restart check)
+    comb: () => COMB,
     async readColumns() { readColumns(); while (M.colBusy) await new Promise(r => setTimeout(r, 2)); },
     async read(name) {
       const B = M.S.B[name], n = B.size / 4;

@@ -402,6 +402,24 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
     check('the long exposure (flakes, fading image, tone curve) builds and draws', !rerr3, rerr3);
   }
 
+  // 24. smoke comb: in an empty river flume a filament from mid-depth stays level and its smoke
+  // travels at about the mean velocity q / h
+  if (want('comb')) {
+    const zb = 0.02, h = 0.20, q = 0.06, rr = flume(6, 0.4, dx, (x, z) => (z < zb ? 1 : 0));
+    await setup(rr, { type: 'river', h0: zb + h, q, hout: h });
+    const dtp = stepFor(dx, 1.0); await M.debug.steps(Math.round(15 / dtp), dtp);
+    M.comb.on = true; M.setComb(1.0);
+    for (let j = 0; j < 240; j++) { await M.debug.steps(Math.max(1, Math.round((1 / 60) / dtp)), dtp); M.stepParticles(1 / 60); }
+    const CB = await M.debug.read('CB'), C = M.debug.comb(), s = Math.floor(C.S / 2), zs = [], sp = [];
+    for (let j = 0; j < C.M; j++) { const o = 4 * (s * C.M + j); if (CB[o + 2] > 0.5) { zs.push(CB[o + 1]); sp.push((CB[o] - 1.0) / CB[o + 2]); } }
+    zs.sort((a, b) => a - b); sp.sort((a, b) => a - b);
+    const spread = zs.length ? zs[zs.length - 1] - zs[0] : 1, v = sp.length ? sp[sp.length >> 1] : 0, U = q / h;
+    check('smoke comb: a mid-depth filament stays level (within 1 cm) and travels at 0.8 to 1.3 times q/h', zs.length > 100 && spread < 0.01 && v / U > 0.8 && v / U < 1.3,
+      zs.length + ' particles, height spread ' + (spread * 1000).toFixed(1) + ' mm, speed ' + (v * 100).toFixed(1) + ' cm/s vs q/h ' + (U * 100).toFixed(1) + ' cm/s');
+    const rerr = await M.debug.validateRender(400, 200); M.comb.on = false;
+    check('the smoke comb filaments build and draw', !rerr, rerr);
+  }
+
   // 23. restart: a river with a moving bed, dye and suspended sand, then reset with a bed readback in
   // flight; everything goes back to the design and the stale readback is not applied
   if (want('restart')) {
