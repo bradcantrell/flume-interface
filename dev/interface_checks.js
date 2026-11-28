@@ -90,6 +90,7 @@ registerModel({
   t: 0, meanSurface() { return [[[1, 0.4], [2, 0.41], [3, 0.42]]]; },
   sectionLines() { return { levels: [], lines: [{ style: 'energy', segs: [[[1, 0.5], [10, 0.46]]] }], marks: [{ x0: 4, x1: 5, z0: 0.49, z1: 0.47 }] }; }, bedRange: [-0.01, 0.02], state() { return { type: 'river' }; },
   comb: { on: false, x: null }, setComb(x) { this.comb.x = x; }, combX() { return this.comb.x; },
+  look: null, setLook(l) { this.look = Object.assign({}, l); },
   wires: { on: false, xs: [] }, setWires(xs) { this.wires.xs = xs.slice(); }, wireXs() { return this.wires.xs; },
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
   render(v) { calls.render++; calls.view = v; },
@@ -250,6 +251,12 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const M0 = T.model, sel = getEl('preset'); sel.value = 'comb'; sel.dispatch('change');
+    const vb = (k) => viewButtons.find(b => b.dataset.view === k).classList.contains('on');
+    const ok1 = M0.comb.on === true && vb('comb') && !vb('energy') && M0.look && M0.look.particles === 'foam';
+    viewButtons.find(b => b.dataset.view === 'grid').click(); const custom = sel.value === 'custom';
+    sel.value = 'default'; sel.dispatch('change'); const back = !M0.comb.on && vb('energy') && vb('ghosts') && M0.look.particles === 'both' && sel.value === 'default';
+    check('a view preset sets the view buttons and the model look together, a change by hand shows custom, default goes back', ok1 && custom && back); }
   { const M0 = T.model; const h0 = T.history.length;
     M0.t = 500; T.addShape('rect', [[2, 0.1], [2.5, 0.3]]);
     const rec = T.history[0], recorded = T.history.length === h0 + 1 && rec.design && rec.bed.length > 10 && rec.water && Math.abs(rec.dE - 0.04) < 1e-6 && rec.marks.length === 1;

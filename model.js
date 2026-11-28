@@ -1615,6 +1615,11 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
   // the dye comb: 14 release points, rings of 600 (10 s of filament at one emission per 1/60 s of
   // model time); every 10th particle is a pulse mark (Marey's chronograph), so the spacing of the
   // marks along a filament is its speed
+  // a view preset's look: particles ('both' | 'foam' | 'tracers' | 'off') and water colour ('depth' | 'speed')
+  M.setLook = function (look) {
+    if (look.particles) { M.particles = look.particles !== 'off'; M.drawKinds = look.particles; const el = document.getElementById('m-part'); if (el) el.value = look.particles; }
+    if (look.colour) { M.colorMode = look.colour === 'speed' ? 1 : 0; const el = document.getElementById('m-color'); if (el) el.value = String(M.colorMode); }
+  };
   M.comb = { on: false, x: null, n: -1, count: 0, acc: 0 };
   M.setComb = function (x) { M.comb.x = x; clearComb(); };
   function clearComb() {

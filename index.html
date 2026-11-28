@@ -144,6 +144,7 @@
       <button id="clear-dye" title="Clear the dye">clear dye</button>
       <select id="speed" title="model seconds per real second"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>real time</option><option value="2">2× speed</option><option value="4">4× speed</option></select>
     </div>
+    <div class="row"><label for="preset">view preset</label><select id="preset" title="Named ways of seeing: each sets the view buttons, particles, water colour and bed drawing together"></select></div>
     <div class="toggles" id="view-toggles">
       <button data-view="levels" class="on" title="Named water levels and the crests of what you drew">levels</button>
       <button data-view="energy" class="on" title="River: the energy line, critical depth and where energy is lost. Waves: the mean water level">energy</button>
@@ -845,9 +846,33 @@ function takeGhost() {
 }
 let wires = [];          // bubble wire positions (m), up to four
 function setView(k, on) {
-  VIEW[k] = on; for (const b of document.querySelectorAll('#view-toggles button')) if (b.dataset.view === k) b.classList.toggle('on', on);
+  VIEW[k] = on; presetCustom(); for (const b of document.querySelectorAll('#view-toggles button')) if (b.dataset.view === k) b.classList.toggle('on', on);
   if (k === 'grid') showGrid = on; if (k === 'streak') applyExposure(); if (k === 'comb' && model && model.comb) model.comb.on = on; if (k === 'wire' && model && model.wires) model.wires.on = on; if (k === 'history') renderHistory();
 }
+// Named presets: each sets the view buttons and a few drawing settings together. Settings not named
+// are left as they are. Changing anything by hand shows the menu as "custom".
+const PRESETS = [
+  { id: 'default', label: 'default', view: { levels: true, energy: true, comb: false, wire: false, streak: false, ghosts: true, history: true, grid: false }, look: { particles: 'both', colour: 'depth' }, set: { bedstyle: 'both' } },
+  { id: 'measure', label: 'measured section', view: { levels: true, energy: true, comb: false, wire: false, streak: false, ghosts: true, history: true, grid: true }, look: { particles: 'off', colour: 'depth' } },
+  { id: 'photo', label: 'flow photograph', view: { levels: false, energy: false, comb: false, wire: false, streak: true, ghosts: false, history: true, grid: false }, look: { particles: 'foam', colour: 'depth' }, exposure: 30 },
+  { id: 'mean', label: 'mean flow (long exposure)', view: { levels: true, energy: true, comb: false, wire: false, streak: true, ghosts: true, history: true, grid: false }, look: { particles: 'foam', colour: 'depth' }, exposure: 86 },
+  { id: 'comb', label: 'dye comb', view: { levels: true, energy: false, comb: true, wire: false, streak: false, ghosts: false, history: true, grid: false }, look: { particles: 'foam', colour: 'depth' } },
+  { id: 'wire', label: 'velocity profiles', view: { levels: true, energy: false, comb: false, wire: true, streak: false, ghosts: false, history: true, grid: true }, look: { particles: 'foam', colour: 'depth' } },
+  { id: 'speed', label: 'speed', view: { levels: false, energy: true, comb: false, wire: false, streak: false, ghosts: false, history: true, grid: false }, look: { particles: 'tracers', colour: 'speed' } },
+  { id: 'compare', label: 'design comparison', view: { levels: true, energy: true, comb: false, wire: false, streak: false, ghosts: true, history: true, grid: false }, look: { particles: 'off', colour: 'depth' } },
+  { id: 'clean', label: 'clean', view: { levels: false, energy: false, comb: false, wire: false, streak: false, ghosts: false, history: false, grid: false }, look: { particles: 'foam', colour: 'depth' } },
+];
+let applyingPreset = false;
+function applyPreset(id) {
+  const pr = PRESETS.find(p => p.id === id); if (!pr) return;
+  applyingPreset = true;
+  for (const [k, on] of Object.entries(pr.view)) setView(k, on);
+  if (pr.exposure != null) { const ex = document.getElementById('exposure'); ex.value = String(pr.exposure); applyExposure(); }
+  if (pr.look && model && model.setLook) model.setLook(pr.look);       // the model's own drawing settings (particles, water colour)
+  for (const [elId, v] of Object.entries(pr.set || {})) { const el = document.getElementById(elId); if (el && el.value !== v) { el.value = v; if (el.dispatch) el.dispatch('change'); else el.dispatchEvent(new Event('change')); } }
+  document.getElementById('preset').value = id; applyingPreset = false;
+}
+function presetCustom() { if (applyingPreset) return; const sel = document.getElementById('preset'); if (sel && sel.value !== 'custom') sel.value = 'custom'; }
 // exposure slider: 0.02 s to 3 s on a log scale
 function exposureFromSlider(v) { return 0.02 * Math.pow(150, v / 100); }
 function applyExposure() {
@@ -1359,7 +1384,7 @@ const GUIDE_STEPS = [
   { title: 'Overview', text: '<p>A laboratory flume seen in section, as if through its glass wall. Water comes in from the left and leaves at the right, or a paddle makes waves.</p><p>Draw anything into it, such as a sill, a reef, a meadow or a different bed, and the water answers as you draw. The physics runs live on your graphics card, and the same flume can be exported to OpenFOAM. It needs a browser with WebGPU, such as a recent Chrome, Edge or Safari.</p>' },
   { title: 'Drawing tools', target: '#toolbar', text: '<p>The first tools are brush, line, polygon, rectangle and ellipse, with an eraser. They draw with the material chosen in the Material panel.</p><p>Then come the instruments. <b>Dye</b> releases a cloud into the water. <b>Comb</b> places a row of dye filaments. <b>Wire</b> adds a bubble wire. <b>Gauge</b> measures the water level over time and charts it under the drawing.</p><p>The <b>bed</b> tool reshapes the floor of the flume.</p>' },
   { title: 'Run', target: () => [document.getElementById('run').parentElement], text: '<p><b>Run</b> starts and pauses the water. <b>Restart</b> runs the same drawing again from still water. <b>Clear</b> empties the flume, and undo in the Scene panel brings the drawing back.</p><p>The speed menu runs the model slower or faster than real time.</p>' },
-  { title: 'Ways of seeing', target: '#view-toggles', text: '<p>Each button switches one way of drawing the flow.</p><p><b>Levels</b> names the water levels and the crests of what you drew. <b>Energy</b> draws the energy line and marks where energy is lost. The <b>Comb</b> view shows the dye filaments and the <b>Wire</b> view shows the bubble timelines. <b>Streak</b> is a long exposure of fine flakes, with its own exposure slider. <b>Ghosts</b> keeps the last runs as faint traces when you change the design. <b>History</b> keeps each run of this flume as a card along the bottom. Click a card to lay that run over the present one, or use its ↺ to bring the design back. <b>Grid</b> adds elevation and distance marks.</p>' },
+  { title: 'Ways of seeing', target: '#view-toggles', text: '<p>Each button switches one way of drawing the flow, and the view preset menu above them sets several at once, such as a flow photograph, a dye comb or velocity profiles.</p><p><b>Levels</b> names the water levels and the crests of what you drew. <b>Energy</b> draws the energy line and marks where energy is lost. The <b>Comb</b> view shows the dye filaments and the <b>Wire</b> view shows the bubble timelines. <b>Streak</b> is a long exposure of fine flakes, with its own exposure slider. <b>Ghosts</b> keeps the last runs as faint traces when you change the design. <b>History</b> keeps each run of this flume as a card along the bottom. Click a card to lay that run over the present one, or use its ↺ to bring the design back. <b>Grid</b> adds elevation and distance marks.</p>' },
   { title: 'Reading the section', target: '#ui', text: '<p>The pink line is the section cut through the ground and the solids you drew. Porous rock shows as stones and plants as stems. Inside the ground, patterns and thin lines show sand and gravel layers.</p><p>Above the water the white line is the energy line. It falls slowly with friction and drops where energy is lost, and the brackets say by how much. The green dotted line is critical depth. Where the water surface crosses it, the flow switches from fast and shallow to slow and deep, or back again.</p>' },
   { title: 'Water', target: sidebarSection('Water'), text: '<p>Choose a river flume or a wave flume. A river sets the discharge and the tailwater depth. Waves set their height and period, and whether the far end absorbs them or a beach takes them.</p><p>The moving bed lets sand and gravel erode and settle, and the bed speed-up setting lets the bed change faster than the water.</p>' },
   { title: 'Flume settings', target: sidebarSection('Flume'), text: '<p>Lab scale starts as a 20 meter glass flume. Field scale starts as a 400 meter reach of river or coast. Length, height and resolution set the grid, and a finer grid is slower.</p><p>The bed drawing setting chooses how sediment shows inside the ground.</p>' },
@@ -1565,7 +1590,10 @@ function wire() {
   $('hgt').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (isFinite(v) && v > 0) setDomain({ H: v }); else syncDomainInputs(); });
   // view toggles (like the sediment interface's): each button switches one layer of the drawing
   for (const b of document.querySelectorAll('#view-toggles button')) b.addEventListener('click', () => setView(b.dataset.view, !VIEW[b.dataset.view]));
-  $('exposure').addEventListener('input', applyExposure); applyExposure();
+  $('exposure').addEventListener('input', () => { applyExposure(); presetCustom(); }); applyExposure();
+  { const sel = $('preset'); sel.innerHTML = PRESETS.map(p => `<option value="${p.id}">${p.label}</option>`).join('') + '<option value="custom" disabled>custom</option>'; sel.value = 'default';
+    sel.addEventListener('change', (e) => applyPreset(e.target.value));
+    $('bedstyle').addEventListener('change', presetCustom); $('model-controls').addEventListener('change', presetCustom); }
   $('bedstyle').addEventListener('change', (e) => { bedStyle = e.target.value; });
   $('res').addEventListener('change', (e) => setDomain({ res: e.target.value }, false));
   $('run').addEventListener('click', () => setRunning(!running));
