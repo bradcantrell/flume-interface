@@ -87,6 +87,7 @@ registerModel({
   setGrid(g, r) { calls.setGrid++; calls.grid = g; calls.raster = r; },
   setRaster(r) { calls.setRaster++; calls.raster = r; },
   reset() { calls.reset++; },
+  t: 0, meanSurface() { return [[[1, 0.4], [2, 0.41], [3, 0.42]]]; },
   comb: { on: false, x: null }, setComb(x) { this.comb.x = x; }, combX() { return this.comb.x; },
   wires: { on: false, xs: [] }, setWires(xs) { this.wires.xs = xs.slice(); }, wireXs() { return this.wires.xs; },
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
@@ -107,7 +108,7 @@ const run = (code) => vm.runInContext(code, sandbox);
 
 (async () => {
   console.log('flume interface checks');
-  run(src + '\n;globalThis.__T = { get DOMAIN() { return DOMAIN; }, get GRID() { return GRID; }, get RASTER() { return RASTER; }, get scene() { return scene; }, get view() { return view; }, get model() { return model; }, get tool() { return tool; }, get selected() { return selected; }, get running() { return running; }, get undoStack() { return undoStack; }, get backends() { return backends; }, MAT, rasterize, rasterHash, w2s, s2w, zoomAt, setVE, fitView, contains, bboxOf, setTool, setDomain, setScale, captureScene, sceneFileText, openSceneText, applyScene, validScene, bedZ, onDown, onMove, onUp, onKey, undo, addShape, deleteSelected, reorderSelected, bedSlope, bedFlat, bedSmooth, setRunning, frame, saveLocal, loadLocal, STORE_KEY, updatePanel, get curMat() { return curMat; } };');
+  run(src + '\n;globalThis.__T = { get DOMAIN() { return DOMAIN; }, get GRID() { return GRID; }, get RASTER() { return RASTER; }, get scene() { return scene; }, get view() { return view; }, get model() { return model; }, get tool() { return tool; }, get selected() { return selected; }, get running() { return running; }, get undoStack() { return undoStack; }, get backends() { return backends; }, MAT, rasterize, rasterHash, w2s, s2w, zoomAt, setVE, fitView, contains, bboxOf, setTool, setDomain, setScale, captureScene, sceneFileText, openSceneText, applyScene, validScene, bedZ, onDown, onMove, onUp, onKey, undo, addShape, deleteSelected, reorderSelected, bedSlope, bedFlat, bedSmooth, setRunning, frame, saveLocal, loadLocal, STORE_KEY, updatePanel, get curMat() { return curMat; }, get ghosts() { return ghosts; } };');
   run(STUB);
   run("registerBackend({ id: 'test-site', title: 'Test Site', mounted: 0, frames: 0, mount() { this.mounted++; }, frame() { this.frames++; } });");
   const T = sandbox.__T, M = T.model, C = M.calls;
@@ -248,6 +249,12 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const M0 = T.model, n0 = T.ghosts.length;
+    M0.t = 100; T.addShape('rect', [[3, 0.1], [3.5, 0.3]]);
+    const one = T.ghosts.length; T.addShape('rect', [[5, 0.1], [5.5, 0.3]]); const stillOne = T.ghosts.length;
+    M0.t = 110; T.addShape('rect', [[7, 0.1], [7.5, 0.3]]); M0.t = 120; T.addShape('rect', [[9, 0.1], [9.5, 0.3]]); M0.t = 130; T.addShape('rect', [[11, 0.1], [11.5, 0.3]]);
+    check('a design change after a run keeps a ghost of it (not while drawing; three at most) with its water line', one === n0 + 1 && stillOne === one && T.ghosts.length === 3 && T.ghosts[0].water && T.ghosts[0].cut.length > 0);
+    T.setDomain({ L: 21 }); check('a change of flume size clears the ghosts', T.ghosts.length === 0); T.setDomain({ L: 20 }); }
   { const M0 = T.model; T.setTool('comb'); const [X, Y] = T.w2s(4.5, 0.3);
     T.onDown({ offsetX: X, offsetY: Y, button: 0 }); if (T.onUp) T.onUp({ offsetX: X, offsetY: Y, button: 0 });
     check('the comb tool places the smoke comb where clicked and turns the comb view on', Math.abs(M0.comb.x - 4.5) < 0.05 && M0.comb.on === true);

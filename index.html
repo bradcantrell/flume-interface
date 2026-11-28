@@ -97,6 +97,7 @@
       <button data-view="comb" title="Smoke comb: filaments released across the depth, pulsed so the spacing of the marks shows speed (place it with the comb tool)">comb</button>
       <button data-view="wire" title="Bubble wires: rows of marks released across the depth; each row bends into the velocity profile (place wires with the wire tool)">wire</button>
       <button data-view="streak" title="Long exposure: fine flakes carried by the water, exposed over a time you set, like a flow photograph">streak</button>
+      <button data-view="ghosts" class="on" title="Ghosts: when you change the design, the last runs' section and mean water line stay as faint traces">ghosts</button>
       <button data-view="grid" title="Elevation and distance marks with a faint metric grid">grid</button>
     </div>
     <div class="row" id="exposure-row" hidden><label for="exposure">exposure <span id="exposure-val"></span></label><input id="exposure" type="range" min="0" max="100" step="1" value="30" title="Short: the flow at this instant (eddies). Long: where the water goes on average"></div>
@@ -335,6 +336,7 @@ function undo() {
 
 // Every edit ends here: rebuild the raster, tell the model, redraw the materials, save.
 function sceneChanged() {
+  takeGhost(); if (model) runStartT = model.t;
   rasterize();
   if (model && model.setRaster) model.setRaster(RASTER);
   buildMatImage(); buildStems();
@@ -537,11 +539,21 @@ const SEC_STYLE = {
 };
 function drawSection(c) {
   const sec = (VIEW.levels || VIEW.energy) && model && model.sectionLines ? model.sectionLines() : null;
-  if (model) model.wantSection = VIEW.energy;
+  if (model) model.wantSection = VIEW.energy || VIEW.ghosts;
   const [X0, Y0] = w2s(0, DOMAIN.H), [X1, Y1] = w2s(DOMAIN.L, 0), labels = [];
   const xa = Math.max(X0, 4), xb = Math.min(X1, view.cw - 4);
   c.save(); c.beginPath(); c.rect(X0, Y0, X1 - X0, Y1 - Y0); c.clip();
   const set = (st) => { const S = SEC_STYLE[st] || SEC_STYLE.crest; c.strokeStyle = S.c; c.setLineDash(S.dash); c.lineWidth = S.w; return S; };
+  if (VIEW.ghosts) {
+    const A = [0.42, 0.26, 0.14];
+    ghosts.forEach((g, gi) => {
+      c.lineWidth = 1; c.setLineDash([3, 3]);
+      c.strokeStyle = `rgba(255,46,147,${A[gi]})`; strokeSegs(c, g.cut);
+      if (g.water) { c.strokeStyle = `rgba(120,225,255,${A[gi] * 1.4})`; for (const seg of g.water) { c.beginPath(); seg.forEach(([x, z], j) => { const [X, Y] = w2s(x, z); j ? c.lineTo(X, Y) : c.moveTo(X, Y); }); c.stroke(); } }
+      if (gi === 0 && g.water && g.water.length) { const seg = g.water[g.water.length - 1], [x, z] = seg[Math.max(0, seg.length - 30)], [X, Y] = w2s(x, z); labels.push({ x: X, y: Y + 13, t: 'previous run', c: 'rgba(120,225,255,0.7)', align: 'right' }); }
+    });
+    c.setLineDash([]);
+  }
   if (VIEW.levels) {
     for (const lv of (sec ? sec.levels : [])) {
       const Y = Math.round(w2s(0, lv.z)[1]) + 0.5; if (Y < 0 || Y > view.ch) continue;
@@ -764,7 +776,18 @@ function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), m 
 function fmtLen(m) { return m >= 1 ? +m.toFixed(2) + ' m' : m >= 0.01 ? +(m * 100).toFixed(1) + ' cm' : +(m * 1000).toFixed(1) + ' mm'; }
 
 let showGrid = false;
-const VIEW = { levels: true, energy: true, comb: false, wire: false, streak: false, grid: false };
+const VIEW = { levels: true, energy: true, comb: false, wire: false, streak: false, ghosts: true, grid: false };
+// Ghosts (memory, level 1): when the design changes after a run of at least GHOST_MIN_T seconds, that
+// run's section cut (bed as it was left, and the shapes) and its time-mean water line are kept as faint
+// traces; three at most, the oldest fades first; cleared on reload or a change of flume size
+const GHOST_MIN_T = 3;
+let ghosts = [], runStartT = 0;
+function takeGhost() {
+  if (!VIEW.ghosts || !model || !(model.t - runStartT >= GHOST_MIN_T)) return;
+  const water = model.meanSurface ? model.meanSurface() : null;
+  ghosts.unshift({ cut: cutSegs.slice(), water, t: model.t - runStartT });
+  if (ghosts.length > 3) ghosts.length = 3;
+}
 let wires = [];          // bubble wire positions (m), up to four
 function setView(k, on) {
   VIEW[k] = on; for (const b of document.querySelectorAll('#view-toggles button')) if (b.dataset.view === k) b.classList.toggle('on', on);
@@ -1042,6 +1065,7 @@ function reorderSelected(dir) {
 // ───────── domain changes ─────────
 // A new length or height stretches the scene with it (shapes, bed), so a design keeps its place.
 function setDomain(next, stretch = true) {
+  ghosts = [];
   const old = Object.assign({}, DOMAIN);
   DOMAIN = Object.assign({}, DOMAIN, next);
   if (stretch && (old.L !== DOMAIN.L || old.H !== DOMAIN.H)) {

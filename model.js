@@ -1792,6 +1792,15 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
     }
     return out;
   };
+  // the time-mean water surface (for the ghosts of earlier runs), as segments in metres; null until
+  // the column average has settled
+  M.meanSurface = function () {
+    const H = M.colHost; if (!H || H.w < 0.3 || !M.grid) return null;
+    const n = H.n, dx = M.grid.dx, segs = []; let seg = [];
+    for (let i = 0; i < n; i++) { const ok = H.wet[i] > 0.9 && H.h[i] > 2 * dx && H.eta[i] > 0; if (ok) seg.push([(i + 0.5) * dx, H.eta[i]]); else if (seg.length) { if (seg.length > 2) segs.push(seg); seg = []; } }
+    if (seg.length > 2) segs.push(seg);
+    return segs;
+  };
   function fmtM(m) { return m >= 1 ? m.toFixed(2) + ' m' : m >= 0.01 ? (m * 100).toFixed(1) + ' cm' : (m * 1000).toFixed(1) + ' mm'; }
   function readScalars() {
     M.readBusy = true; const gen = M.gen;
