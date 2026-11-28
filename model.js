@@ -629,7 +629,7 @@ fn fAt2(x:f32, z:f32) -> f32 { return f[cellOf(x, z)]; }
 fn vel(x:f32, z:f32) -> vec2f { return vec2f(sU(x, z), sW(x, z)); }
 fn shearAt(x:f32, z:f32) -> f32 { let d = prm.dx; return abs(sU(x, z + d) - sU(x, z - d))/(2.0*d) + abs(sW(x + d, z) - sW(x - d, z))/(2.0*d); }
 `),
-    // Smoke comb (after Marey's smoke machine): S release points spread over the depth at x = xc, each
+    // Dye comb (after Marey's smoke machine, in water as dye): S release points spread over the depth at x = xc, each
     // a ring of M particles; every emission resets slot n of every ring to its release point, so each
     // ring traced in slot order is a streakline. Particles that reach air, a solid or the ends stop.
     // CU: 0 dt, 1 emit now, 2 slot n, 3 xc, 4 S, 5 M, 6 emission count
@@ -1040,7 +1040,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
   return vec4f(col, l*0.95);
 }`;
 
-  // smoke comb filaments: a segment from each particle to the one released before it on the same ring;
+  // dye comb filaments: a segment from each particle to the one released before it on the same ring;
   // pulse marks (every Pth release) drawn brighter and wider; older smoke fades
   const COMB_LINE = `
 struct V { x0:f32, z0:f32, s:f32, ve:f32, cw:f32, ch:f32, dx:f32, L:f32, nx:f32, nz:f32, mode:f32, H:f32, time:f32, umax:f32, depthRef:f32, dpr:f32 };
@@ -1612,7 +1612,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) a: f32 };
       M.bedBusy = false;
     }, () => { M.bedBusy = false; });
   }
-  // the smoke comb: 14 release points, rings of 600 (10 s of filament at one emission per 1/60 s of
+  // the dye comb: 14 release points, rings of 600 (10 s of filament at one emission per 1/60 s of
   // model time); every 10th particle is a pulse mark (Marey's chronograph), so the spacing of the
   // marks along a filament is its speed
   M.comb = { on: false, x: null, n: -1, count: 0, acc: 0 };

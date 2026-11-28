@@ -24,7 +24,7 @@ function makeEl(id, tag = 'div') {
     dispatch(t, e = {}) { for (const fn of this.listeners[t] || []) fn(Object.assign({ target: this, preventDefault() {} }, e)); },
     getContext: () => el._ctx || (el._ctx = ctxProxy()),
     getBoundingClientRect: () => ({ left: 0, top: 0, width: W, height: H }),
-    setPointerCapture() {}, appendChild() {}, remove() {}, click() { this.dispatch('click'); if (this.download) downloads.push(this.download); },
+    setPointerCapture() {}, appendChild() {}, remove() {}, setAttribute(k, v) { this[k] = v; }, getClientRects() { return [1]; }, click() { this.dispatch('click'); if (this.download) downloads.push(this.download); },
     toBlob(cb) { cb({ size: 1 }); },
     querySelectorAll(sel) { return queryAll(sel, this); },
   };
@@ -67,7 +67,7 @@ const store = new Map();
 const sandbox = {
   console, Math, JSON, Date, Object, Array, Set, Map, Uint8Array, Uint32Array, Float32Array, Float64Array, Uint8ClampedArray, Promise, Error, parseFloat, parseInt, isFinite, String, Number, Proxy, setTimeout, clearTimeout,
   performance: { now: () => Date.now() },
-  document: { getElementById: getEl, createElement: (t) => makeEl('', t), querySelectorAll: (s) => queryAll(s), body: { appendChild() {} } },
+  document: { getElementById: getEl, createElement: (t) => makeEl('', t), querySelectorAll: (s) => queryAll(s), querySelector: (s) => (s.startsWith('#') ? getEl(s.slice(1)) : queryAll(s)[0] || null), body: { appendChild() {} } },
   window: { addEventListener: (t, fn) => { (winListeners[t] = winListeners[t] || []).push(fn); }, devicePixelRatio: 1 },
   requestAnimationFrame: (cb) => { rafCb = cb; },
   localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) },
@@ -249,6 +249,10 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { getEl('guide-btn').click(); const opened = getEl('guide').classList.contains('open');
+    getEl('guide-next').click(); getEl('guide-next').click(); getEl('guide-next').click(); const cnt = getEl('guide-count').textContent, title = getEl('guide-title').textContent;
+    getEl('guide-x').click();
+    check('the guide opens, steps through its cards and closes', opened && /^4 of \d+$/.test(cnt) && title === 'Ways of seeing' && !getEl('guide').classList.contains('open')); }
   { const M0 = T.model, n0 = T.ghosts.length;
     M0.t = 100; T.addShape('rect', [[3, 0.1], [3.5, 0.3]]);
     const one = T.ghosts.length; T.addShape('rect', [[5, 0.1], [5.5, 0.3]]); const stillOne = T.ghosts.length;
