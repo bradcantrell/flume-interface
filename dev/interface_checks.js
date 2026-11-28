@@ -88,6 +88,7 @@ registerModel({
   setRaster(r) { calls.setRaster++; calls.raster = r; },
   reset() { calls.reset++; },
   t: 0, meanSurface() { return [[[1, 0.4], [2, 0.41], [3, 0.42]]]; },
+  sectionLines() { return { levels: [], lines: [{ style: 'energy', segs: [[[1, 0.5], [10, 0.46]]] }], marks: [{ x0: 4, x1: 5, z0: 0.49, z1: 0.47 }] }; }, bedRange: [-0.01, 0.02], state() { return { type: 'river' }; },
   comb: { on: false, x: null }, setComb(x) { this.comb.x = x; }, combX() { return this.comb.x; },
   wires: { on: false, xs: [] }, setWires(xs) { this.wires.xs = xs.slice(); }, wireXs() { return this.wires.xs; },
   frame(dt, running) { calls.frame++; if (running) calls.framesRunning++; },
@@ -108,7 +109,7 @@ const run = (code) => vm.runInContext(code, sandbox);
 
 (async () => {
   console.log('flume interface checks');
-  run(src + '\n;globalThis.__T = { get DOMAIN() { return DOMAIN; }, get GRID() { return GRID; }, get RASTER() { return RASTER; }, get scene() { return scene; }, get view() { return view; }, get model() { return model; }, get tool() { return tool; }, get selected() { return selected; }, get running() { return running; }, get undoStack() { return undoStack; }, get backends() { return backends; }, MAT, rasterize, rasterHash, w2s, s2w, zoomAt, setVE, fitView, contains, bboxOf, setTool, setDomain, setScale, captureScene, sceneFileText, openSceneText, applyScene, validScene, bedZ, onDown, onMove, onUp, onKey, undo, addShape, deleteSelected, reorderSelected, bedSlope, bedFlat, bedSmooth, setRunning, frame, saveLocal, loadLocal, STORE_KEY, updatePanel, get curMat() { return curMat; }, get ghosts() { return ghosts; } };');
+  run(src + '\n;globalThis.__T = { get DOMAIN() { return DOMAIN; }, get GRID() { return GRID; }, get RASTER() { return RASTER; }, get scene() { return scene; }, get view() { return view; }, get model() { return model; }, get tool() { return tool; }, get selected() { return selected; }, get running() { return running; }, get undoStack() { return undoStack; }, get backends() { return backends; }, MAT, rasterize, rasterHash, w2s, s2w, zoomAt, setVE, fitView, contains, bboxOf, setTool, setDomain, setScale, captureScene, sceneFileText, openSceneText, applyScene, validScene, bedZ, onDown, onMove, onUp, onKey, undo, addShape, deleteSelected, reorderSelected, bedSlope, bedFlat, bedSmooth, setRunning, frame, saveLocal, loadLocal, STORE_KEY, updatePanel, get curMat() { return curMat; }, get ghosts() { return ghosts; }, get history() { return history; }, get historyOn() { return historyOn; }, recordRun, restoreRun, sanitizeHistory };');
   run(STUB);
   run("registerBackend({ id: 'test-site', title: 'Test Site', mounted: 0, frames: 0, mount() { this.mounted++; }, frame() { this.frames++; } });");
   const T = sandbox.__T, M = T.model, C = M.calls;
@@ -249,14 +250,23 @@ const run = (code) => vm.runInContext(code, sandbox);
   check('Space again pauses', T.running === false);
   const rs = C.reset; T.onKey({ key: 'r', target: {}, preventDefault() {} });
   check('R restarts the model', C.reset === rs + 1);
+  { const M0 = T.model; const h0 = T.history.length;
+    M0.t = 500; T.addShape('rect', [[2, 0.1], [2.5, 0.3]]);
+    const rec = T.history[0], recorded = T.history.length === h0 + 1 && rec.design && rec.bed.length > 10 && rec.water && Math.abs(rec.dE - 0.04) < 1e-6 && rec.marks.length === 1;
+    const kept = T.recordRun(true); M0.t = 520; const kept2 = T.recordRun(true);
+    const inFile = JSON.parse(T.sceneFileText()).history.length === T.history.length;
+    const nShapes = T.scene.shapes.length; T.restoreRun(rec); const restored = T.scene.shapes.length === rec.design.shapes.length; T.undo();
+    const bad = T.sanitizeHistory([Object.assign({}, rec, { thumb: 'javascript:alert(1)' }), { n: 'x' }]);
+    check('the run history records a run on a design change (design, bed, water line, energy lost) and on keep run, and is saved with the scene', recorded && kept === null && kept2 && inFile);
+    check('a kept run brings its design back, undo returns, and opened histories are cleaned (bad pictures and records dropped)', restored && T.scene.shapes.length === nShapes && bad.length === 1 && bad[0].thumb === null); }
   { getEl('guide-btn').click(); const opened = getEl('guide').classList.contains('open');
     getEl('guide-next').click(); getEl('guide-next').click(); getEl('guide-next').click(); const cnt = getEl('guide-count').textContent, title = getEl('guide-title').textContent;
     getEl('guide-x').click();
     check('the guide opens, steps through its cards and closes', opened && /^4 of \d+$/.test(cnt) && title === 'Ways of seeing' && !getEl('guide').classList.contains('open')); }
   { const M0 = T.model, n0 = T.ghosts.length;
-    M0.t = 100; T.addShape('rect', [[3, 0.1], [3.5, 0.3]]);
+    M0.t += 100; T.addShape('rect', [[3, 0.1], [3.5, 0.3]]);
     const one = T.ghosts.length; T.addShape('rect', [[5, 0.1], [5.5, 0.3]]); const stillOne = T.ghosts.length;
-    M0.t = 110; T.addShape('rect', [[7, 0.1], [7.5, 0.3]]); M0.t = 120; T.addShape('rect', [[9, 0.1], [9.5, 0.3]]); M0.t = 130; T.addShape('rect', [[11, 0.1], [11.5, 0.3]]);
+    M0.t += 10; T.addShape('rect', [[7, 0.1], [7.5, 0.3]]); M0.t += 10; T.addShape('rect', [[9, 0.1], [9.5, 0.3]]); M0.t += 10; T.addShape('rect', [[11, 0.1], [11.5, 0.3]]);
     check('a design change after a run keeps a ghost of it (not while drawing; three at most) with its water line', one === n0 + 1 && stillOne === one && T.ghosts.length === 3 && T.ghosts[0].water && T.ghosts[0].cut.length > 0);
     T.setDomain({ L: 21 }); check('a change of flume size clears the ghosts', T.ghosts.length === 0); T.setDomain({ L: 20 }); }
   { const M0 = T.model; T.setTool('comb'); const [X, Y] = T.w2s(4.5, 0.3);
